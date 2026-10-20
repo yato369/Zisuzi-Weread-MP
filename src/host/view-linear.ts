@@ -1285,7 +1285,7 @@ export class WmcView extends ItemView {
     });
 
     holder = box.createDiv('wmc-preview-body');
-    const paint = async (job: Promise<PreviewResult>): Promise<void> => {
+    const paint = async (job: Promise<PreviewResult>, autoRetried = false): Promise<void> => {
       holder.empty();
       holder.removeClass('markdown-rendered');
       holder.createDiv({ cls: 'wmc-hint', text: '正在读取正文…（只在内存里，不落盘）' });
@@ -1293,10 +1293,20 @@ export class WmcView extends ItemView {
       if (!holder.isConnected) return;
       holder.empty();
       if (!res.ok) {
+        // 登录态过期（-2010/-2012）先别急着让用户扫码：走一次静默续期
+        // （wr_rt 有效期内可直接换新 wr_skey），成功就自动重试一次
+        const needLogin = /登录|2010|2012/.test(res.reason || '');
+        if (needLogin && !autoRetried) {
+          holder.createDiv({ cls: 'wmc-hint', text: '登录态过期，正在尝试自动续期…' });
+          const ok = await this.plugin.renewSession(true);
+          if (ok) {
+            void paint(this.plugin.previewArticle(r.reviewId), true);
+            return;
+          }
+        }
         holder.createDiv({ cls: 'wmc-hint', text: res.reason || '预览失败' });
         // 登录态过期（-2010/-2012）是最常见的失败：直接给一个重新扫码的入口，
         // 不用让用户自己去设置页翻
-        const needLogin = /登录|2010|2012/.test(res.reason || '');
         if (needLogin) {
           const login = holder.createEl('button', { cls: 'wmc-text-btn is-primary', text: '重新扫码登录' });
           login.addEventListener('click', () => this.plugin.startQrLogin());

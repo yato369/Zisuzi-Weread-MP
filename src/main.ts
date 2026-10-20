@@ -14,7 +14,6 @@ import {
 } from 'obsidian';
 import {
   WereadClient,
-  baseHeaders,
   checkCookie,
   describeCookieCheck,
   normalizeCookie,
@@ -29,6 +28,7 @@ import {
   extractMpOriginalUrl,
 } from './core/weread';
 import { htmlToMarkdown, replaceImagePlaceholders, replaceMediaPlaceholders, safeFileName } from './core/html2md';
+import { nodeRawRequest } from './core/raw-net';
 import { WmcView, VIEW_TYPE_WMC } from './host/view-linear';
 import { BackfillModal } from './host/backfill-modal';
 import { QrLoginModal } from './host/qr-login-modal';
@@ -577,14 +577,14 @@ export default class WereadMpCatcher extends Plugin {
     }
   }
 
-  /** 30 分钟一次轻量保活：让服务端把 wr_skey 续上，避免长时间不用就过期 */
+  /** 80 分钟一次轻量保活：skey 是 90 分钟寿命，续期接口靠 wr_rt 随时能换新 */
   private scheduleKeepAlive(): void {
     this.stopKeepAlive();
     if (this.settings.keepAlive === false) return;
     if (!this.hasLogin()) return;
     // 启动后先补一次（cookie 可能已经放了很久）
     window.setTimeout(() => void this.renewSession(true), 15_000);
-    this.keepAliveTimer = window.setInterval(() => void this.renewSession(true), 20 * 60_000);
+    this.keepAliveTimer = window.setInterval(() => void this.renewSession(true), 80 * 60_000);
     this.registerInterval(this.keepAliveTimer);
   }
 
@@ -604,50 +604,62 @@ export default class WereadMpCatcher extends Plugin {
   }
 
   /**
-   * 轻量续期：请求首页 HTML（浏览器刷新时正是这个响应下发新的 wr_skey），
-   * 新凭据由 absorbSetCookie 写回 settings.cookie。
+   * 续期：走微信读书官方的 /web/login/renewal（浏览器端 skey 过期后前端就是调它，
+   * 靠 Set-Cookie 换新 wr_skey，不需要重新扫码；前提是 wr_rt 还有效，约 30 天）。
+   *
+   * 关键实现点：必须用 Node 原生 https —— requestUrl 会把 set-cookie 从响应头里剥掉
+   * （forbidden header），Electron 会话容器在渲染进程里也拿不到，前两版续期因此失效。
    */
   async renewSession(silent = true): Promise<boolean> {
     if (!this.hasLogin()) return false;
     const before = this.settings.cookie;
     const cookie = normalizeCookie(before || '');
+    const headers: Record<string, string> = {
+      Cookie: cookie,
+      'User-Agent': WEREAD_UA,
+      Referer: 'https://weread.qq.com/',
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+      Origin: 'https://weread.qq.com',
+    };
     try {
-      // 用首页 HTML 而不是 API：浏览器刷新网页时正是靠这个响应下发新的 wr_skey。
-      // 带上 Accept: text/html，避免被当成 XHR 走另一条分支。
-      const r = await this.http('https://weread.qq.com/', {
-        ...baseHeaders(cookie),
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      });
-      const sessionCount = await this.absorbSessionCookies();
-      const renewed = this.settings.cookie !== before;
-      if (r.status === 200 && renewed) {
+      // 官方续期接口：POST 为主，个别账号只认 GET 时退一次
+      let r = await nodeRawRequest('https://weread.qq.com/web/login/renewal', headers, 'POST');
+      let sc = r.headers['set-cookie'];
+      if (r.status !== 200 && !sc) {
+        r = await nodeRawRequest('https://weread.qq.com/web/login/renewal', headers, 'GET');
+        sc = r.headers['set-cookie'];
+      }
+      if (r.status === 0) {
+        this.renewFails++;
+        if (!silent) new Notice(`续期失败：${r.error || '网络错误'}`, 6000);
+        else if (this.renewFails === 1) this.pushLog(`续期网络异常：${r.error || '未知'}`, 'warn');
+        return false;
+      }
+      // Node 通道下 set-cookie 真的可见了：数组原样交给 absorbSetCookie 吸收
+      const renewed = sc ? this.absorbSetCookie({ 'set-cookie': sc } as unknown as Record<string, string>) : false;
+      if (renewed && this.settings.cookie !== before) {
         this.renewFails = 0;
         this.renewNoCookieWarned = false;
         this.settings.webLoginOk = true;
         this.settings.webLoginAt = Date.now();
-        if (!silent) new Notice('登录态已续期');
+        this.settings.webLoginMsg = '自动续期成功';
+        if (!silent) new Notice('登录态已续期（wr_skey 已换新）');
+        else this.pushLog('续期成功：wr_skey 已换新，无需重新扫码', 'info');
         return true;
       }
-      if (r.status !== 200) {
-        this.renewFails++;
-        if (this.renewFails === 1 || !silent) {
-          this.pushLog(`续期请求异常：HTTP ${r.status}`, 'warn');
-          new Notice(`续期失败：HTTP ${r.status}，稍后再试`, 7000);
-        }
-        return false;
-      }
-      // 200 但没换 cookie：服务端通常只在临近过期时才续，这是正常状态，不算失败
+      // 200 但没换 cookie：skey 还没过期（服务端只在过期时才通过 renewal 换发）——正常
       this.renewFails = 0;
+      const body = (r.text || '').slice(0, 120);
       if (!this.renewNoCookieWarned) {
         this.renewNoCookieWarned = true;
-        const keys = Object.keys(r.headers || {});
-        const hasSetCookie = keys.some((k) => k.toLowerCase() === 'set-cookie');
-        this.pushLog(
-          `续期返回 200：响应头 ${keys.length} 个 / Set-Cookie ${hasSetCookie ? '有' : '无'}；Electron 会话里读到 ${sessionCount} 个 wr_* cookie（凭据未变化）`,
-          'info',
-        );
+        this.pushLog(`renewal 返回 ${r.status}，未换发新 skey（skey 未过期时属正常）：${body}`, 'info');
       }
-      if (!silent) new Notice('续期请求已发送：服务端本次没有换发新凭据（未临近过期时属正常）', 7000);
+      if (!silent) {
+        // wr_rt 失效时接口会明确报错，只有这种情况才真的需要重新扫码
+        if (/-2012|-2010/.test(body)) new Notice('wr_rt 已失效，需要重新扫码登录', 8000);
+        else new Notice('续期接口已调用：当前 skey 未过期，暂无需换发（属正常）', 7000);
+      }
       return true;
     } catch (e) {
       this.renewFails++;
@@ -974,7 +986,7 @@ export default class WereadMpCatcher extends Plugin {
 
   async onload() {
     await this.loadAll();
-    // 轻量保活：30 分钟一次，避免 wr_skey 因长时间不发请求而过期
+    // 轻量保活：80 分钟一次，续期接口靠 wr_rt 换新 wr_skey，无需重新扫码
     this.scheduleKeepAlive();
 
     this.statusEl = this.addStatusBarItem();
@@ -3234,7 +3246,7 @@ class WMSettingTab extends PluginSettingTab {
     this.frToggle(
       containerEl,
       '登录态自动续期',
-      '默认开启。每 20 分钟请求一次微信读书首页，让服务端续发新的 wr_skey；抓取时收到的 Set-Cookie 也会自动保存。这样不用每隔一个多小时就重新扫码',
+      '默认开启。每 80 分钟调一次微信读书官方续期接口，自动换发新的 wr_skey（wr_skey 本身 90 分钟过期）；抓取时收到的 Set-Cookie 也会自动保存。这样不用每隔一个多小时就重新扫码',
       this.plugin.settings.keepAlive !== false,
       (v) => this.plugin.setKeepAlive(v),
     );
