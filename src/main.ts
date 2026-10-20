@@ -14,6 +14,7 @@ import {
 } from 'obsidian';
 import {
   WereadClient,
+  baseHeaders,
   checkCookie,
   describeCookieCheck,
   normalizeCookie,
@@ -114,6 +115,8 @@ export interface WMSettings {
   delayListMs: number;
   delayContentMs: number;
   downloadImages: boolean;
+  /** 每 30 分钟打一次轻量请求，让服务端续期 wr_skey（默认开） */
+  keepAlive?: boolean;
   autoStart: boolean;
 }
 
@@ -206,6 +209,7 @@ const DEFAULTS: WMSettings = {
   delayListMs: 6000,
   delayContentMs: 4500,
   downloadImages: true,
+  keepAlive: true,
   autoStart: false,
 };
 
@@ -355,6 +359,11 @@ export default class WereadMpCatcher extends Plugin {
   /** 列表请求硬闸门：上次时间 + 近 1 小时计数（所有入口共用） */
   private lastListReqAt = 0;
   private listReqLog: number[] = [];
+  /** Set-Cookie 续期后的写盘防抖 + 保活定时器 */
+  private cookieSaveTimer: number | null = null;
+  private keepAliveTimer: number | null = null;
+  private renewFails = 0;
+  private renewNoCookieWarned = false;
   private statusEl: HTMLElement | null = null;
 
   private watch: WatchStatus = {
@@ -423,7 +432,7 @@ export default class WereadMpCatcher extends Plugin {
           timer = window.setTimeout(() => rej(new Error(`请求超时 8 秒：${url.slice(0, 70)}`)), 8000);
         }),
       ]);
-      return { status: r.status, text: r.text, bytes: r.arrayBuffer };
+      return { status: r.status, text: r.text, bytes: r.arrayBuffer, headers: r.headers as Record<string, string> };
     } finally {
       if (timer !== undefined) window.clearTimeout(timer);
     }
@@ -474,6 +483,136 @@ export default class WereadMpCatcher extends Plugin {
     this.listReqLog.push(this.lastListReqAt);
   }
 
+  /**
+   * 服务端每次请求都可能通过 Set-Cookie 换发新的 wr_skey（默认约 90 分钟就过期）。
+   * 这里把新凭据吸收回 settings.cookie —— 只要插件还在发请求，登录态就能自己滚下去。
+   */
+  private absorbSetCookie(headers?: Record<string, string>): void {
+    if (!headers) return;
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === 'set-cookie');
+    if (!key) return;
+    const raw = headers[key] as unknown;
+    const lines = Array.isArray(raw) ? raw.map((x) => String(x)) : String(raw ?? '').split(/\n/);
+    if (!lines.length) return;
+    const kv = new Map<string, string>();
+    for (const part of normalizeCookie(this.settings.cookie || '').split(';')) {
+      const i = part.indexOf('=');
+      if (i > 0) kv.set(part.slice(0, i).trim(), part.slice(i + 1).trim());
+    }
+    let touched = false;
+    for (const line of lines) {
+      // 一行里可能塞了多个 cookie，按 ", name=" 再切一次
+      for (const piece of String(line).split(/,(?=\s*[A-Za-z0-9_]+=)/)) {
+        const first = piece.split(';')[0].trim();
+        const i = first.indexOf('=');
+        if (i <= 0) continue;
+        const name = first.slice(0, i).trim();
+        const value = first.slice(i + 1).trim();
+        if (!/^wr_(skey|rt|vid|gid|ql)$/.test(name) || !value) continue;
+        if (kv.get(name) !== value) {
+          kv.set(name, value);
+          touched = true;
+        }
+      }
+    }
+    if (!touched) return;
+    const order = ['wr_vid', 'wr_skey', 'wr_rt', 'wr_gid', 'wr_ql'];
+    const parts: string[] = [];
+    const seen = new Set<string>();
+    for (const k of order) {
+      const v = kv.get(k);
+      if (v) {
+        parts.push(`${k}=${v}`);
+        seen.add(k);
+      }
+    }
+    for (const [k, v] of kv) if (!seen.has(k)) parts.push(`${k}=${v}`);
+    this.settings.cookie = parts.join('; ');
+    this.settings.webLoginOk = true;
+    this.settings.webLoginAt = Date.now();
+    this.settings.webLoginMsg = '自动续期成功';
+    // 防抖写盘：一轮抓取会连着收到多次 Set-Cookie，别每次都写 data.json
+    if (this.cookieSaveTimer !== null) window.clearTimeout(this.cookieSaveTimer);
+    this.cookieSaveTimer = window.setTimeout(() => {
+      this.cookieSaveTimer = null;
+      void this.saveAll();
+    }, 3000);
+  }
+
+  /** 30 分钟一次轻量保活：让服务端把 wr_skey 续上，避免长时间不用就过期 */
+  private scheduleKeepAlive(): void {
+    this.stopKeepAlive();
+    if (this.settings.keepAlive === false) return;
+    if (!this.hasLogin()) return;
+    // 启动后先补一次（cookie 可能已经放了很久）
+    window.setTimeout(() => void this.renewSession(true), 15_000);
+    this.keepAliveTimer = window.setInterval(() => void this.renewSession(true), 30 * 60_000);
+    this.registerInterval(this.keepAliveTimer);
+  }
+
+  /** 设置页开关：开/关自动续期 */
+  setKeepAlive(on: boolean): void {
+    this.settings.keepAlive = on;
+    if (on) this.scheduleKeepAlive();
+    else this.stopKeepAlive();
+    void this.saveAll();
+  }
+
+  private stopKeepAlive(): void {
+    if (this.keepAliveTimer !== null) {
+      window.clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
+  }
+
+  /**
+   * 轻量续期：/api/user/info 是最便宜的登录态探测，
+   * 服务端会顺带下发新的 wr_skey（由 absorbSetCookie 写回）。
+   */
+  async renewSession(silent = true): Promise<boolean> {
+    if (!this.hasLogin()) return false;
+    const before = this.settings.cookie;
+    const cookie = normalizeCookie(before || '');
+    try {
+      // 用首页 HTML 而不是 API：浏览器刷新网页时正是靠这个响应下发新的 wr_skey。
+      // 带上 Accept: text/html，避免被当成 XHR 走另一条分支。
+      const r = await this.http('https://weread.qq.com/', {
+        ...baseHeaders(cookie),
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      });
+      const renewed = this.settings.cookie !== before;
+      if (r.status === 200 && renewed) {
+        this.renewFails = 0;
+        this.renewNoCookieWarned = false;
+        this.settings.webLoginOk = true;
+        this.settings.webLoginAt = Date.now();
+        if (!silent) new Notice('登录态已续期');
+        return true;
+      }
+      if (r.status !== 200) {
+        this.renewFails++;
+        if (this.renewFails === 1 || !silent) {
+          this.pushLog(`续期请求异常：HTTP ${r.status}`, 'warn');
+          new Notice(`续期失败：HTTP ${r.status}，稍后再试`, 7000);
+        }
+        return false;
+      }
+      // 200 但没拿到新 cookie：可能服务端只在临近过期时才续，先记一条日志
+      this.renewFails++;
+      if (!this.renewNoCookieWarned) {
+        this.renewNoCookieWarned = true;
+        this.pushLog('续期请求成功，但服务端没有下发新的 wr_skey（可能仍未临近过期）', 'info');
+      }
+      if (!silent) new Notice('没有拿到新凭据：登录态可能已失效，必要时重新扫码', 9000);
+      return false;
+    } catch (e) {
+      this.renewFails++;
+      if (!silent) new Notice(`续期失败：${e instanceof Error ? e.message : String(e)}`, 6000);
+      return false;
+    }
+  }
+
+
   private http: HttpFn = async (url: string, headers: Record<string, string>) => {
     await this.listGate(url);
     const useSession = !!this.settings.useSession;
@@ -483,7 +622,10 @@ export default class WereadMpCatcher extends Plugin {
       delete h1.cookie;
     }
     const r1 = await this.rawHttp(url, h1);
-    if (this.respOk(r1)) return r1;
+    if (this.respOk(r1)) {
+      this.absorbSetCookie(r1.headers);
+      return r1;
+    }
     // 反向兜底：session 模式失败就试手动 Cookie，反之亦然
     const h2: Record<string, string> = { ...headers };
     if (useSession) {
@@ -668,6 +810,7 @@ export default class WereadMpCatcher extends Plugin {
       const prof = await this.refreshProfile().catch(() => null);
       const n = await this.syncAccountsFromShelf().catch(() => 0);
       await this.checkWebLogin().catch(() => null);
+      this.scheduleKeepAlive();
       this.notifyViews();
       this.renderStatus();
       this.emitWatch();
@@ -787,6 +930,8 @@ export default class WereadMpCatcher extends Plugin {
 
   async onload() {
     await this.loadAll();
+    // 轻量保活：30 分钟一次，避免 wr_skey 因长时间不发请求而过期
+    this.scheduleKeepAlive();
 
     this.statusEl = this.addStatusBarItem();
     this.renderStatus();
@@ -917,6 +1062,11 @@ export default class WereadMpCatcher extends Plugin {
 
   onunload() {
     this.stopAll();
+    this.stopKeepAlive();
+    if (this.cookieSaveTimer !== null) {
+      window.clearTimeout(this.cookieSaveTimer);
+      this.cookieSaveTimer = null;
+    }
     this.statusEl?.remove();
     this.statusEl = null;
   }
@@ -1021,6 +1171,7 @@ export default class WereadMpCatcher extends Plugin {
         const prof = await this.refreshProfile().catch(() => null);
         const n = await this.syncAccountsFromShelf().catch(() => 0);
         const web = await this.checkWebLogin().catch(() => ({ ok: false, msg: '未知' }));
+        this.scheduleKeepAlive();
         this.notifyViews();
         this.renderStatus();
         this.emitWatch();
@@ -1388,6 +1539,7 @@ export default class WereadMpCatcher extends Plugin {
   async logout(): Promise<void> {
     // 正在盯采就先停掉，否则空 cookie 的轮询会刷一堆 -2012 错误
     this.stopAll();
+    this.stopKeepAlive();
     try {
       // 运行时按需加载 electron 模块：静态 import 会在移动端直接崩
       const session = electronModule()?.remote?.session?.defaultSession;
@@ -3256,6 +3408,21 @@ class WMSettingTab extends PluginSettingTab {
         await this.plugin.saveAll();
       },
     );
+
+    this.frToggle(
+      containerEl,
+      '登录态自动续期',
+      '默认开启。每 30 分钟发一次轻量请求（用户信息接口），让服务端续发 wr_skey，避免约 90 分钟就过期要重新扫码；抓取时收到的 Set-Cookie 也会自动保存',
+      this.plugin.settings.keepAlive !== false,
+      (v) => this.plugin.setKeepAlive(v),
+    );
+
+    this.frButtons(containerEl, '手动续期', '长时间没用、又不确定登录态还在不在时，点一下探测并续期', [
+      {
+        text: '立即续期',
+        onClick: () => this.plugin.renewSession(false),
+      },
+    ]);
 
     /* 4. AI 模型 */
     containerEl.createDiv({ cls: 'wmc-settings-h', text: 'AI 模型（可选）' });

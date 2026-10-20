@@ -21,6 +21,8 @@ export interface HttpResp {
   status: number;
   text: string;
   bytes: ArrayBuffer;
+  /** 响应头（用于抓 Set-Cookie 续期，Obsidian requestUrl 会给） */
+  headers?: Record<string, string>;
 }
 
 export type HttpFn = (url: string, headers: Record<string, string>) => Promise<HttpResp>;
