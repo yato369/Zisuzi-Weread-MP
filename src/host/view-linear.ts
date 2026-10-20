@@ -281,28 +281,11 @@ export class WmcView extends ItemView {
       this.mode = this.mode === 'agent' ? 'list' : 'agent';
       this.render();
     });
-    this.iconBtn(bar, 'radar', this.panelOpen ? '关闭盯采管理' : '盯采管理：勾选要跟的公众号', () => {
-      this.panelOpen = !this.panelOpen;
-      this.render();
-    });
     // 已登录才显示：一键清空登录态，方便干净重扫（切号救急入口）
     if (this.plugin.loginState() !== 'none') {
       this.iconBtn(bar, 'log-out', '退出登录：清空登录态，方便重新扫码', () => void this.plugin.logoutAccount());
     }
 
-    const grabBtn = this.iconBtn(bar, 'refresh-cw', '抓取一轮：先盯列表，再归档新文', () => {
-      void (async () => {
-        if (grabBtn.hasClass('is-syncing')) return;
-        const orbCtl = this.mountOrb(grabBtn);
-        orbCtl.start();
-        try {
-          await this.plugin.runOnce(true);
-        } finally {
-          orbCtl.stop();
-          this.render();
-        }
-      })();
-    }, true);
     this.iconBtn(bar, 'archive', '归档全部历史：按号批量补历史文章', () =>
       new BackfillModal(this.app, this.plugin, this.account || undefined).open(),
     );
@@ -432,21 +415,6 @@ export class WmcView extends ItemView {
     this.iconBtn(actions, 'download', '立即采一轮（归档已发现的文章）', () =>
       void this.plugin.runOnce(true, { list: false, collect: true }),
     );
-    const mkToggle = (label: string, on: boolean, title: string, onClick: () => void) => {
-      const b = actions.createEl('button', { cls: `wmc-watch-toggle${on ? ' is-on' : ''}`, text: label });
-      b.setAttr('aria-pressed', String(on));
-      b.setAttr('aria-label', title);
-      b.addEventListener('click', onClick);
-      return b;
-    };
-    mkToggle('盯', s.running, s.running ? '暂停盯（停止更新列表）' : '开启盯：每轮只更新列表，绝不写笔记', () => {
-      this.plugin.toggleWatchFromView();
-      this.render();
-    });
-    mkToggle('采', s.collecting, s.collecting ? '暂停采（停止自动归档）' : '开启采：每轮把已发现的未归档文章落盘', () => {
-      this.plugin.toggleCollectFromView();
-      this.render();
-    });
     this.iconBtn(actions, 'scroll-text', this.logOpen ? '收起日志' : '盯采日志', () => {
       this.logOpen = !this.logOpen;
       this.render();
@@ -525,9 +493,6 @@ export class WmcView extends ItemView {
     fill.className = `wmc-progress-fill is-${mode}`;
     fill.setCssStyles({ width: `${Math.round(pct * 100)}%` });
     text.setText(t);
-    const toggles = bar.querySelectorAll<HTMLElement>('.wmc-watch-toggle');
-    const want = [s.running, s.collecting];
-    toggles.forEach((b, i) => b.toggleClass('is-on', !!want[i]));
   }
 
   /* ------------------------- 盯采管理面板（抽屉） ------------------------- */

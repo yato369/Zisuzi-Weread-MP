@@ -1,6 +1,6 @@
 {
   "name": "weread-mp-fork",
-  "version": "4.6.1",
+  "version": "4.6.2",
   "description": "Archive WeChat Official Account articles from your WeRead shelf as local Markdown notes.",
   "main": "main.js",
   "type": "module",

@@ -3480,27 +3480,3 @@
   -webkit-user-select: text;
   user-select: text;
 }
-
-/* ------------------------- 盯 / 采 两个独立开关 --------------------------- */
-.wmc-watch-actions .wmc-watch-toggle {
-  height: 22px;
-  min-width: 24px;
-  padding: 0 6px;
-  border: 1px solid var(--wmc-line);
-  border-radius: var(--wmc-r-xs);
-  background: transparent;
-  color: var(--wmc-ink-3);
-  font-size: 11px;
-  line-height: 20px;
-  box-shadow: none;
-}
-
-.wmc-watch-actions .wmc-watch-toggle:hover {
-  background: var(--wmc-hover);
-}
-
-.wmc-watch-actions .wmc-watch-toggle.is-on {
-  border-color: transparent;
-  background: var(--wmc-brand);
-  color: #fff;
-}
