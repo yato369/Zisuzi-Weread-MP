@@ -874,22 +874,18 @@ export class WmcView extends ItemView {
     top.createSpan({ cls: 'wmc-side-title', text: '公众号' });
     const syncBtn = top.createEl('button', { cls: 'wmc-icon-btn' });
     setIcon(syncBtn, 'refresh-cw');
-    syncBtn.setAttr('aria-label', '同步最新：只拉新文章，不动已存历史');
+    syncBtn.setAttr('aria-label', '拉取当前号最新 1 页（不拉历史、不归档）');
     // LoadingOrb：Claude Code 用的字符轮转，5 帧叠在同一位置只切透明度，字符不抖动
     syncBtn.addEventListener('click', () => {
       void (async () => {
-      if (!this.account) {
-        new Notice('先在左栏选一个公众号');
-        return;
-      }
+      // 未选具体号时交给 fetchLatestForAccount 给出明确提示（「全部文章」不能直接拉）
       if (syncBtn.hasClass('is-syncing')) return;
       const orbCtl = this.mountOrb(syncBtn);
       orbCtl.start();
-      syncBtn.setAttr('aria-label', '同步中…');
-      const n = await this.plugin.syncNewArticles(this.account, 20).catch(() => 0);
+      syncBtn.setAttr('aria-label', '拉取中…');
+      const n = await this.plugin.fetchLatestForAccount(this.account);
       orbCtl.stop();
-      syncBtn.setAttr('aria-label', '同步最新：只拉新文章，不动已存历史');
-      new Notice(n > 0 ? `「${this.account}」新增 ${n} 篇` : '没有新文章');
+      syncBtn.setAttr('aria-label', '拉取当前号最新 1 页（不拉历史、不归档）');
       if (n > 0) this.renderList();
         })();
     });
@@ -947,10 +943,10 @@ export class WmcView extends ItemView {
           });
           return;
         }
-        // 有缓存 → 后台只拉最新几页做增量，遇到已知就停
+        // 有缓存 → 后台只补最新 1 页（单次请求），不再翻多页
         if (this.synced.has(name)) return;
         this.synced.add(name);
-        void this.plugin.syncNewArticles(name).then((n) => {
+        void this.plugin.fetchLatestForAccount(name, true).then((n) => {
           if (n > 0) {
             new Notice(`「${name}」新增 ${n} 篇`, 4000);
             this.renderList();

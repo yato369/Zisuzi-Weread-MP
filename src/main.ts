@@ -1595,6 +1595,63 @@ export default class WereadMpCatcher extends Plugin {
    * 一旦某页全是已知文章，说明作者没有新发（存量列表是固定的），立即停。
    * 这样选号时无需重新翻全部历史。
    */
+  /**
+   * 侧栏「拉取最新」：只请求最新 1 页（最多 20 条），**不翻历史、不归档**。
+   * 这是最容易触发 -2014 的入口，所以固定 1 次列表请求，排队与计数交给 listGate。
+   */
+  async fetchLatestForAccount(name: string, silent = false): Promise<number> {
+    if (!name) {
+      new Notice('请先在左侧点选一个具体公众号；「全部文章」不能直接拉取', 6000);
+      return -1;
+    }
+    const acc =
+      this.settings.accounts.find((a) => a.name === name) ||
+      this.settings.shelfAccounts.find((a) => a.name === name);
+    if (!acc?.bookId) {
+      if (!silent) new Notice(`找不到「${name}」的公众号 ID：先在设置里同步书架`, 6000);
+      return 0;
+    }
+    if (!this.hasLogin()) {
+      if (!silent) new Notice('还没登录：先在设置里扫码', 6000);
+      return 0;
+    }
+    const cookie = normalizeCookie(this.settings.cookie || '');
+    const client = new WereadClient(this.http, cookie);
+    if (!this.state.discovered) this.state.discovered = {};
+    try {
+      const items = await client.listArticles(acc.bookId, 0);
+      let added = 0;
+      for (const it of items) {
+        if (this.state.discovered[it.reviewId]) continue;
+        this.state.discovered[it.reviewId] = {
+          account: acc.name,
+          title: it.title,
+          time: it.time,
+          readNum: it.readNum,
+          likeNum: it.likeNum,
+          picUrl: it.picUrl,
+          digest: it.digest,
+        };
+        added++;
+      }
+      if (added) await this.saveAll();
+      this.notifyViews();
+      if (!silent) {
+        new Notice(
+          added
+            ? `「${name}」已拉取最新 1 页：新增 ${added} 篇（未归档）`
+            : `「${name}」最新 1 页没有新文章`,
+          5000,
+        );
+      }
+      return added;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!silent) new Notice(`拉取失败：${msg}`, 9000);
+      return 0;
+    }
+  }
+
   async syncNewArticles(name: string, maxPages = 5): Promise<number> {
     const acc =
       this.settings.accounts.find((a) => a.name === name) ||
