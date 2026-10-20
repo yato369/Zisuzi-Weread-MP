@@ -483,50 +483,33 @@ export default class WereadMpCatcher extends Plugin {
     this.listReqLog.push(this.lastListReqAt);
   }
 
-  /**
-   * 服务端每次请求都可能通过 Set-Cookie 换发新的 wr_skey（默认约 90 分钟就过期）。
-   * 这里把新凭据吸收回 settings.cookie —— 只要插件还在发请求，登录态就能自己滚下去。
-   */
-  private absorbSetCookie(headers?: Record<string, string>): void {
-    if (!headers) return;
-    const key = Object.keys(headers).find((k) => k.toLowerCase() === 'set-cookie');
-    if (!key) return;
-    const raw = headers[key] as unknown;
-    const lines = Array.isArray(raw) ? raw.map((x) => String(x)) : String(raw ?? '').split(/\n/);
-    if (!lines.length) return;
-    const kv = new Map<string, string>();
+  /** 把一组 wr_* cookie 合并回 settings.cookie；有变化返回 true */
+  private mergeCookieKv(kv: Map<string, string>): boolean {
+    const cur = new Map<string, string>();
     for (const part of normalizeCookie(this.settings.cookie || '').split(';')) {
       const i = part.indexOf('=');
-      if (i > 0) kv.set(part.slice(0, i).trim(), part.slice(i + 1).trim());
+      if (i > 0) cur.set(part.slice(0, i).trim(), part.slice(i + 1).trim());
     }
     let touched = false;
-    for (const line of lines) {
-      // 一行里可能塞了多个 cookie，按 ", name=" 再切一次
-      for (const piece of String(line).split(/,(?=\s*[A-Za-z0-9_]+=)/)) {
-        const first = piece.split(';')[0].trim();
-        const i = first.indexOf('=');
-        if (i <= 0) continue;
-        const name = first.slice(0, i).trim();
-        const value = first.slice(i + 1).trim();
-        if (!/^wr_(skey|rt|vid|gid|ql)$/.test(name) || !value) continue;
-        if (kv.get(name) !== value) {
-          kv.set(name, value);
-          touched = true;
-        }
+    for (const [k, v] of kv) {
+      if (!v) continue;
+      if (cur.get(k) !== v) {
+        cur.set(k, v);
+        touched = true;
       }
     }
-    if (!touched) return;
+    if (!touched) return false;
     const order = ['wr_vid', 'wr_skey', 'wr_rt', 'wr_gid', 'wr_ql'];
     const parts: string[] = [];
     const seen = new Set<string>();
     for (const k of order) {
-      const v = kv.get(k);
+      const v = cur.get(k);
       if (v) {
         parts.push(`${k}=${v}`);
         seen.add(k);
       }
     }
-    for (const [k, v] of kv) if (!seen.has(k)) parts.push(`${k}=${v}`);
+    for (const [k, v] of cur) if (!seen.has(k)) parts.push(`${k}=${v}`);
     this.settings.cookie = parts.join('; ');
     this.settings.webLoginOk = true;
     this.settings.webLoginAt = Date.now();
@@ -537,6 +520,61 @@ export default class WereadMpCatcher extends Plugin {
       this.cookieSaveTimer = null;
       void this.saveAll();
     }, 3000);
+    return true;
+  }
+
+  /**
+   * 从响应的 Set-Cookie 里吸收新凭据（wr_skey 约 90 分钟过期，服务端会换发）。
+   */
+  private absorbSetCookie(headers?: Record<string, string>): boolean {
+    if (!headers) return false;
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === 'set-cookie');
+    if (!key) return false;
+    const raw = headers[key] as unknown;
+    const lines = Array.isArray(raw) ? raw.map((x) => String(x)) : String(raw ?? '').split(/\n/);
+    const kv = new Map<string, string>();
+    for (const line of lines) {
+      // 一行里可能塞了多个 cookie，按 ", name=" 再切一次
+      for (const piece of String(line).split(/,(?=\s*[A-Za-z0-9_]+=)/)) {
+        const first = piece.split(';')[0].trim();
+        const i = first.indexOf('=');
+        if (i <= 0) continue;
+        const name = first.slice(0, i).trim();
+        const value = first.slice(i + 1).trim();
+        if (!/^wr_(skey|rt|vid|gid|ql)$/.test(name) || !value) continue;
+        kv.set(name, value);
+      }
+    }
+    return this.mergeCookieKv(kv);
+  }
+
+  /**
+   * 直接从 Electron 会话的 cookie 容器读（requestUrl 的响应会被 Chromium 自动写进去，
+   * 不依赖 Obsidian 是否把 Set-Cookie 透给插件）。返回读到的 wr_* 数量。
+   */
+  private async absorbSessionCookies(): Promise<number> {
+    type CookieLike = { name?: string; value?: string };
+    type SessionLike = { cookies?: { get?: (q: unknown) => Promise<CookieLike[]> } };
+    try {
+      const mod = electronModule() as unknown as {
+        remote?: { session?: { defaultSession?: SessionLike } };
+        session?: { defaultSession?: SessionLike };
+      };
+      const ses = mod?.remote?.session?.defaultSession ?? mod?.session?.defaultSession;
+      if (!ses?.cookies?.get) return 0;
+      const list = await ses.cookies.get({ domain: 'weread.qq.com' });
+      const kv = new Map<string, string>();
+      for (const c of list) {
+        if (!c?.name || !c.value) continue;
+        if (!/^wr_(skey|rt|vid|gid|ql)$/.test(c.name)) continue;
+        kv.set(c.name, c.value);
+      }
+      if (!kv.size) return 0;
+      this.mergeCookieKv(kv);
+      return kv.size;
+    } catch {
+      return 0;
+    }
   }
 
   /** 30 分钟一次轻量保活：让服务端把 wr_skey 续上，避免长时间不用就过期 */
@@ -580,6 +618,7 @@ export default class WereadMpCatcher extends Plugin {
         ...baseHeaders(cookie),
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       });
+      const sessionCount = await this.absorbSessionCookies();
       const renewed = this.settings.cookie !== before;
       if (r.status === 200 && renewed) {
         this.renewFails = 0;
@@ -604,7 +643,7 @@ export default class WereadMpCatcher extends Plugin {
         const keys = Object.keys(r.headers || {});
         const hasSetCookie = keys.some((k) => k.toLowerCase() === 'set-cookie');
         this.pushLog(
-          `续期返回 200：${hasSetCookie ? '有 Set-Cookie 但凭据未变化' : '响应头里没有 Set-Cookie（可能未临近过期，或 Obsidian 未透出响应头）'}`,
+          `续期返回 200：响应头 ${keys.length} 个 / Set-Cookie ${hasSetCookie ? '有' : '无'}；Electron 会话里读到 ${sessionCount} 个 wr_* cookie（凭据未变化）`,
           'info',
         );
       }
