@@ -985,6 +985,8 @@ export default class WereadMpCatcher extends Plugin {
     this.app.workspace.onLayoutReady(() => {
       const dup = this.app.workspace.getLeavesOfType(VIEW_TYPE_WMC);
       if (dup.length > 1) dup.slice(1).forEach((leaf) => leaf.detach());
+      // 笔记可能被用户在文件管理器里删掉：启动时对一次账，别让统计留着幽灵记录
+      void this.pruneProcessed(true);
     });
     this.addRibbonIcon('rss', '微信读书公众号：打开列表', () => void this.activateView());
     this.addCommand({
@@ -993,6 +995,11 @@ export default class WereadMpCatcher extends Plugin {
       callback: () => void this.activateView(),
     });
 
+    this.addCommand({
+      id: 'prune-archived',
+      name: '校正已归档索引（按笔记文件是否存在）',
+      callback: () => void this.pruneProcessed(false),
+    });
     this.addCommand({
       id: 'fetch-now',
       name: '立即抓取一轮',
@@ -1171,6 +1178,29 @@ export default class WereadMpCatcher extends Plugin {
       new Notice(`防风控保护已拦下这次修改：\n${changed.join('、')}\n要跑更快的参数，请先关掉「防风控保护」`, 10000);
     }
     return changed;
+  }
+
+  /**
+   * 校正「已归档」索引：笔记被手动删除/移走后，processed 里会留下幽灵记录，
+   * 导致统计里的「已归档」和筛选结果都偏大。这里按文件是否真实存在来对齐。
+   */
+  async pruneProcessed(silent = true): Promise<number> {
+    const proc = this.state.processed || {};
+    let removed = 0;
+    for (const [rid, v] of Object.entries(proc)) {
+      const path = v?.path || '';
+      const f = path ? this.app.vault.getAbstractFileByPath(path) : null;
+      if (!(f instanceof TFile)) {
+        delete proc[rid];
+        removed++;
+      }
+    }
+    if (removed) {
+      await this.saveAll();
+      this.notifyViews();
+      if (!silent) new Notice(`已校正 ${removed} 条失效的归档记录（对应笔记文件已不存在）`, 8000);
+    }
+    return removed;
   }
 
   async saveAll() {
@@ -3599,6 +3629,13 @@ class WMSettingTab extends PluginSettingTab {
 
     this.frButtons(containerEl, '立即抓取一轮', undefined, [
       { text: '抓取', cta: true, onClick: () => this.plugin.runOnce(true) },
+      {
+        text: '校正归档索引',
+        onClick: async () => {
+          await this.plugin.pruneProcessed(false);
+          this.refreshUI();
+        },
+      },
       {
         text: '清空已归档记录',
         danger: true,
