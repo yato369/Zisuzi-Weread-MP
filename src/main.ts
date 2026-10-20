@@ -218,10 +218,13 @@ const MIN_INTERVAL = 15; // 风控下限：低于 15 分钟不进风控红线
  * 收敛后：每轮 3 次、间隔 6 秒、45 分钟一轮 ≈ 96 次/天，速率也平缓。
  */
 const SAFE_RATE = {
-  maxAccountsPerRun: 3,
-  delayListMs: 6000,
-  intervalMin: 45,
-  delayContentMs: 4500,
+  maxAccountsPerRun: 2,
+  delayListMs: 15000,
+  intervalMin: 60,
+  delayContentMs: 6000,
+  pages: 1,
+  /** 每小时列表请求硬上限（硬闸门计数，超过直接拒绝发请求） */
+  listPerHour: 12,
 } as const;
 
 const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
@@ -349,6 +352,9 @@ export default class WereadMpCatcher extends Plugin {
   private previewPending = new Map<string, Promise<PreviewResult>>();
   /** 上一次正文请求的时间戳，用来给预览之间留安全间隔（防风控） */
   private lastContentAt = 0;
+  /** 列表请求硬闸门：上次时间 + 近 1 小时计数（所有入口共用） */
+  private lastListReqAt = 0;
+  private listReqLog: number[] = [];
   private statusEl: HTMLElement | null = null;
 
   private watch: WatchStatus = {
@@ -439,7 +445,32 @@ export default class WereadMpCatcher extends Plugin {
     return true;
   }
 
+  /**
+   * 列表接口硬闸门：盯、手动拉号、翻页、自检全部共用。
+   * 1) 两次请求间隔 ≥ delayListMs（保护档 15s）；
+   * 2) 近 1 小时不超过 listPerHour 次（保护档 12 次）。
+   * 超预算直接抛错 —— 宁可这一轮不跑，也不去撞 -2014。
+   */
+  private async listGate(url: string): Promise<void> {
+    if (!/\/web\/mp\/articles/.test(url)) return;
+    const safe = this.settings.rateSafeMode !== false;
+    const now = Date.now();
+    this.listReqLog = this.listReqLog.filter((t) => now - t < 3600_000);
+    const budget = safe ? SAFE_RATE.listPerHour : 120;
+    if (this.listReqLog.length >= budget) {
+      throw new Error(
+        `防风控闸门：近 1 小时已发 ${this.listReqLog.length} 次列表请求（上限 ${budget} 次），先停手，一小时后再试`,
+      );
+    }
+    const gap = safe ? SAFE_RATE.delayListMs : Math.max(1000, this.settings.delayListMs || 1500);
+    const wait = this.lastListReqAt + gap - now;
+    if (wait > 0) await sleep(Math.min(wait, 60000));
+    this.lastListReqAt = Date.now();
+    this.listReqLog.push(this.lastListReqAt);
+  }
+
   private http: HttpFn = async (url: string, headers: Record<string, string>) => {
+    await this.listGate(url);
     const useSession = !!this.settings.useSession;
     const h1: Record<string, string> = { ...headers };
     if (useSession) {
@@ -894,21 +925,58 @@ export default class WereadMpCatcher extends Plugin {
     // 防风控保护：把速率参数收敛到实测安全的档位。
     // 直接改 data.json 没用 —— 运行中的插件会用内存里的 settings 回写覆盖，
     // 所以必须在每次加载时收敛，才不会被打回危险区。
-    if (this.settings.rateSafeMode !== false) {
-      const S = this.settings;
-      if (!S.maxAccountsPerRun || S.maxAccountsPerRun > SAFE_RATE.maxAccountsPerRun) {
-        S.maxAccountsPerRun = SAFE_RATE.maxAccountsPerRun;
-      }
-      if (!S.delayListMs || S.delayListMs < SAFE_RATE.delayListMs) S.delayListMs = SAFE_RATE.delayListMs;
-      if (!S.intervalMin || S.intervalMin < SAFE_RATE.intervalMin) S.intervalMin = SAFE_RATE.intervalMin;
-      if (!S.delayContentMs || S.delayContentMs < SAFE_RATE.delayContentMs) {
-        S.delayContentMs = SAFE_RATE.delayContentMs;
-      }
-    }
+    this.enforceRate(false);
     if (!this.state.processed) this.state.processed = {};
   }
 
+  /**
+   * 把速率参数钉在防风控档。
+   * 返回被回退的字段说明（供设置页提示用户）。
+   * 保护开着时，界面上填得再激进也会被拉回来 —— 只有先关掉保护才允许自由调参。
+   */
+  enforceRate(notify = false): string[] {
+    if (this.settings.rateSafeMode === false) return [];
+    const S = this.settings;
+    const changed: string[] = [];
+    const fix = (bad: boolean, apply: () => void, text: string) => {
+      if (!bad) return;
+      apply();
+      changed.push(text);
+    };
+    fix(
+      !S.maxAccountsPerRun || S.maxAccountsPerRun > SAFE_RATE.maxAccountsPerRun,
+      () => (S.maxAccountsPerRun = SAFE_RATE.maxAccountsPerRun),
+      `每轮检查号数 → ${SAFE_RATE.maxAccountsPerRun}`,
+    );
+    fix(
+      !S.delayListMs || S.delayListMs < SAFE_RATE.delayListMs,
+      () => (S.delayListMs = SAFE_RATE.delayListMs),
+      `列表间隔 → ${SAFE_RATE.delayListMs}ms`,
+    );
+    fix(
+      !S.intervalMin || S.intervalMin < SAFE_RATE.intervalMin,
+      () => (S.intervalMin = SAFE_RATE.intervalMin),
+      `轮询间隔 → ${SAFE_RATE.intervalMin} 分钟`,
+    );
+    fix(
+      !S.delayContentMs || S.delayContentMs < SAFE_RATE.delayContentMs,
+      () => (S.delayContentMs = SAFE_RATE.delayContentMs),
+      `正文间隔 → ${SAFE_RATE.delayContentMs}ms`,
+    );
+    fix(
+      !S.pages || S.pages > SAFE_RATE.pages,
+      () => (S.pages = SAFE_RATE.pages),
+      `翻页数 → ${SAFE_RATE.pages}`,
+    );
+    if (changed.length && notify) {
+      new Notice(`防风控保护已拦下这次修改：\n${changed.join('、')}\n要跑更快的参数，请先关掉「防风控保护」`, 10000);
+    }
+    return changed;
+  }
+
   async saveAll() {
+    // 最后一道闸：无论从哪个入口改的，写盘前都收敛一次
+    this.enforceRate(true);
     const payload: { settings: WMSettings; state: WMState } = {
       settings: { ...this.settings },
       state: this.state,
@@ -3018,6 +3086,7 @@ class WMSettingTab extends PluginSettingTab {
         if (Number.isFinite(n) && n > 0) {
           this.plugin.settings.intervalMin = Math.max(MIN_INTERVAL, Math.round(n));
           await this.plugin.saveAll();
+          this.display();
         }
       },
       { numeric: true },
@@ -3033,6 +3102,7 @@ class WMSettingTab extends PluginSettingTab {
         if (Number.isFinite(n) && n >= 1) {
           this.plugin.settings.pages = Math.min(5, Math.round(n));
           await this.plugin.saveAll();
+          this.display();
         }
       },
       { numeric: true },
@@ -3049,6 +3119,7 @@ class WMSettingTab extends PluginSettingTab {
           if (Number.isFinite(n) && n >= 1) {
             this.plugin.settings.maxPerRun = Math.min(30, Math.round(n));
             await this.plugin.saveAll();
+            this.display();
           }
         },
       },
@@ -3059,6 +3130,7 @@ class WMSettingTab extends PluginSettingTab {
           if (Number.isFinite(n) && n >= 1) {
             this.plugin.settings.maxPerAccount = Math.min(10, Math.round(n));
             await this.plugin.saveAll();
+            this.display();
           }
         },
       },
@@ -3067,7 +3139,7 @@ class WMSettingTab extends PluginSettingTab {
     this.frToggle(
       containerEl,
       '防风控保护（建议开启）',
-      '开启时每次加载都会强制收敛到安全档：每轮检查号数 ≤3、列表间隔 ≥6000ms、轮询间隔 ≥45 分钟、正文间隔 ≥4500ms。你在界面上填得更激进也会被拉回；确实要跑更快的参数，得先关掉这个开关',
+      '开启时每次保存都会强制收敛到安全档：每轮检查号数 ≤2、列表间隔 ≥15000ms、轮询间隔 ≥60 分钟、正文间隔 ≥6000ms、翻页 1 页；另外所有列表请求共用一个硬闸门（间隔 ≥15s、每小时 ≤12 次）。你填得更激进会被回退并弹出提示；确实要跑更快，得先关掉这个开关',
       this.plugin.settings.rateSafeMode !== false,
       async (v) => {
         this.plugin.settings.rateSafeMode = v;
@@ -3087,6 +3159,7 @@ class WMSettingTab extends PluginSettingTab {
           if (Number.isFinite(n) && n >= 1) {
             this.plugin.settings.maxAccountsPerRun = Math.min(50, Math.round(n));
             await this.plugin.saveAll();
+            this.display();
           }
         },
       },
@@ -3097,6 +3170,7 @@ class WMSettingTab extends PluginSettingTab {
           if (Number.isFinite(n) && n >= 500) {
             this.plugin.settings.delayListMs = Math.min(30000, Math.round(n));
             await this.plugin.saveAll();
+            this.display();
           }
         },
       },
@@ -3112,6 +3186,7 @@ class WMSettingTab extends PluginSettingTab {
         if (Number.isFinite(n) && n >= 300) {
           this.plugin.settings.delayContentMs = Math.min(60000, Math.round(n));
           await this.plugin.saveAll();
+          this.display();
         }
       },
       { numeric: true },
@@ -3130,7 +3205,7 @@ class WMSettingTab extends PluginSettingTab {
         text:
           `当前估算：每轮 ${perRun} 次列表请求 × 每天约 ${roundsPerDay} 轮 ≈ ${mine} 次/天` +
           `（27 个号全量拉则是 ${naive} 次/天）；覆盖一遍全部公众号约需 ${coverHours.toFixed(1)} 小时。` +
-          `保守档参考：每轮 3、间隔 6000ms、45 分钟一轮 → 约 96 次/天。`,
+          `保守档：每轮 2、间隔 15000ms、60 分钟一轮 → 约 48 次/天，且每小时硬上限 12 次。`,
       });
     }
 
@@ -3139,7 +3214,7 @@ class WMSettingTab extends PluginSettingTab {
       const row = new Setting(containerEl)
         .setName('列表接口限频冷却中（-2014）')
         .setDesc(
-          `已暂停发请求到 ${new Date(coolUntil).toLocaleString()}（连续命中 ${this.plugin.state.listCooldownHits ?? 1} 次，退避自动加长）。确认已解除（比如浏览器里能正常打开公众号列表）再手动解除。`,
+          `已暂停发请求到 ${new Date(coolUntil).toLocaleString()}（剩余约 ${Math.max(1, Math.ceil((coolUntil - Date.now()) / 60000))} 分钟；连续命中 ${this.plugin.state.listCooldownHits ?? 1} 次，退避自动加长）。冷却期间不会发任何列表请求；确认浏览器里能正常打开公众号列表后，再手动解除。`,
         );
       row.addButton((b) =>
         b
