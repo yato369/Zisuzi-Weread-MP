@@ -546,7 +546,7 @@ export default class WereadMpCatcher extends Plugin {
     if (!this.hasLogin()) return;
     // 启动后先补一次（cookie 可能已经放了很久）
     window.setTimeout(() => void this.renewSession(true), 15_000);
-    this.keepAliveTimer = window.setInterval(() => void this.renewSession(true), 30 * 60_000);
+    this.keepAliveTimer = window.setInterval(() => void this.renewSession(true), 20 * 60_000);
     this.registerInterval(this.keepAliveTimer);
   }
 
@@ -597,14 +597,14 @@ export default class WereadMpCatcher extends Plugin {
         }
         return false;
       }
-      // 200 但没拿到新 cookie：可能服务端只在临近过期时才续，先记一条日志
-      this.renewFails++;
+      // 200 但没换 cookie：服务端通常只在临近过期时才续，这是正常状态，不算失败
+      this.renewFails = 0;
       if (!this.renewNoCookieWarned) {
         this.renewNoCookieWarned = true;
-        this.pushLog('续期请求成功，但服务端没有下发新的 wr_skey（可能仍未临近过期）', 'info');
+        this.pushLog('续期请求已发送；本次服务端未换发新凭据（未临近过期时正常）', 'info');
       }
-      if (!silent) new Notice('没有拿到新凭据：登录态可能已失效，必要时重新扫码', 9000);
-      return false;
+      if (!silent) new Notice('续期请求已发送：服务端本次没有换发新凭据（未临近过期时属正常）', 7000);
+      return true;
     } catch (e) {
       this.renewFails++;
       if (!silent) new Notice(`续期失败：${e instanceof Error ? e.message : String(e)}`, 6000);
@@ -3045,7 +3045,7 @@ class WMSettingTab extends PluginSettingTab {
     this.frToggle(
       containerEl,
       '登录态自动续期',
-      '默认开启。每 30 分钟请求一次微信读书首页，让服务端续发新的 wr_skey；抓取时收到的 Set-Cookie 也会自动保存。这样不用每隔一个多小时就重新扫码',
+      '默认开启。每 20 分钟请求一次微信读书首页，让服务端续发新的 wr_skey；抓取时收到的 Set-Cookie 也会自动保存。这样不用每隔一个多小时就重新扫码',
       this.plugin.settings.keepAlive !== false,
       (v) => this.plugin.setKeepAlive(v),
     );
