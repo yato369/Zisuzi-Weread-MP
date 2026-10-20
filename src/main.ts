@@ -453,6 +453,11 @@ export default class WereadMpCatcher extends Plugin {
    */
   private async listGate(url: string): Promise<void> {
     if (!/\/web\/mp\/articles/.test(url)) return;
+    // 冷却期一律不发：手动点、翻页、自检都走这里，避免绕过冷却继续撞 -2014
+    const coolLeft = (this.state.listCooldownUntil ?? 0) - Date.now();
+    if (coolLeft > 0) {
+      throw new Error(`列表接口冷却中（-2014），还需约 ${Math.max(1, Math.ceil(coolLeft / 60000))} 分钟`);
+    }
     const safe = this.settings.rateSafeMode !== false;
     const now = Date.now();
     this.listReqLog = this.listReqLog.filter((t) => now - t < 3600_000);
@@ -1340,7 +1345,8 @@ export default class WereadMpCatcher extends Plugin {
       try {
         items = await client.listArticles(acc.bookId, offset);
       } catch (e) {
-        if (e instanceof RiskError) new Notice(e.message, 9000);
+        // 闸门/冷却抛的也是 Error，必须显示出来，否则会被误报成「没有新文章」
+        new Notice(e instanceof Error ? e.message : String(e), 9000);
         break;
       }
       if (!items.length) break;
