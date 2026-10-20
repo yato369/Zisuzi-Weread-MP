@@ -307,7 +307,10 @@ export interface WatchLogItem {
 }
 
 export interface WatchStatus {
+  /** 盯：定时拉列表、更新发现清单，不写任何笔记 */
   running: boolean;
+  /** 采：定时把已发现的未归档文章落盘 */
+  collecting: boolean;
   busy: boolean;
   phase: 'idle' | 'list' | 'fetch' | 'done' | 'cooldown';
   account?: string;
@@ -350,6 +353,7 @@ export default class WereadMpCatcher extends Plugin {
 
   private watch: WatchStatus = {
     running: false,
+    collecting: false,
     busy: false,
     phase: 'idle',
     accountIndex: 0,
@@ -771,8 +775,13 @@ export default class WereadMpCatcher extends Plugin {
     });
     this.addCommand({
       id: 'toggle-watch',
-      name: '开始 / 停止自动盯采',
-      callback: () => (this.timer ? this.stopWatch(true) : this.startWatch(true)),
+      name: '开始 / 停止「盯」（只更新列表）',
+      callback: () => this.toggleWatchFromView(),
+    });
+    this.addCommand({
+      id: 'toggle-collect',
+      name: '开始 / 停止「采」（归档已发现的文章）',
+      callback: () => this.toggleCollectFromView(),
     });
     this.addCommand({
       id: 'open-login',
@@ -863,15 +872,15 @@ export default class WereadMpCatcher extends Plugin {
       this.settings.autoStart = false;
       await this.saveAll();
       if (wasOn) {
-        this.pushLog('已关闭「启动时自动盯采」：不会自动抓取，需手动点「开始更新」', 'warn');
+        this.pushLog('已关闭「启动时自动盯列表」：启动后不会自动拉列表，也不会归档', 'warn');
       }
     }
 
-    if (this.settings.autoStart) this.startWatch(false);
+    if (this.settings.autoStart) this.setWatching(true);
   }
 
   onunload() {
-    this.stopWatch(false);
+    this.stopAll();
     this.statusEl?.remove();
     this.statusEl = null;
   }
@@ -1304,7 +1313,7 @@ export default class WereadMpCatcher extends Plugin {
   /** 登出：清本地登录态 + 清 Electron session 里 weread 域 cookie（不清的话重扫码还是旧账号） */
   async logout(): Promise<void> {
     // 正在盯采就先停掉，否则空 cookie 的轮询会刷一堆 -2012 错误
-    if (this.timer !== null) this.stopWatch(false);
+    this.stopAll();
     try {
       // 运行时按需加载 electron 模块：静态 import 会在移动端直接崩
       const session = electronModule()?.remote?.session?.defaultSession;
@@ -1621,49 +1630,90 @@ export default class WereadMpCatcher extends Plugin {
 
   /* -------------------------------- watching ------------------------------- */
 
-  startWatch(notify: boolean) {
-    const min = Math.max(MIN_INTERVAL, Math.round(this.settings.intervalMin || 30));
-    this.stopWatch(false);
-    this.state.watchSince = Date.now();
-    this.timer = window.setInterval(() => void this.runOnce(false), min * 60 * 1000);
-    this.registerInterval(this.timer);
-    this.watch.running = true;
-    this.watch.nextRunAt = Date.now() + min * 60 * 1000;
-    this.pushLog(`自动更新已开启 · 每 ${min} 分钟看一次`, 'ok');
+  /**
+   * 「盯」：只定时拉公众号列表、更新发现清单，**不写任何笔记、不下载正文**。
+   * 和「采」共用一个定时器，避免两套循环同时打接口。
+   */
+  setWatching(on: boolean, notify = false) {
+    this.watch.running = on;
+    if (on) this.state.watchSince = Date.now();
+    this.syncTimer();
+    this.pushLog(on ? '盯已开启 · 只更新列表，不归档' : '盯已暂停', on ? 'ok' : 'warn');
     this.emitWatch();
     this.renderStatus();
-    if (notify) new Notice(`自动盯采已开启：每 ${min} 分钟一轮`);
+    if (notify) new Notice(on ? '盯已开启：定时更新列表，不写笔记' : '盯已暂停');
   }
 
-  stopWatch(notify: boolean) {
+  /**
+   * 「采」：只把**已经发现**的未归档文章抓下来落盘。
+   * 不拉列表，因此不消耗列表接口配额，也不受列表限频冷却影响。
+   */
+  setCollecting(on: boolean, notify = false) {
+    this.watch.collecting = on;
+    if (on) this.state.watchSince = Date.now();
+    this.syncTimer();
+    this.pushLog(on ? '采已开启 · 只归档已发现的文章' : '采已暂停', on ? 'ok' : 'warn');
+    this.emitWatch();
+    this.renderStatus();
+    if (notify) new Notice(on ? '采已开启：只归档已发现的文章' : '采已暂停');
+  }
+
+  /** 两个开关中任意一个开着就保留定时器，全关则停 */
+  private syncTimer() {
+    const min = Math.max(MIN_INTERVAL, Math.round(this.settings.intervalMin || 30));
+    if (this.timer !== null) {
+      window.clearInterval(this.timer);
+      this.timer = null;
+    }
+    if (!this.watch.running && !this.watch.collecting) {
+      this.watch.nextRunAt = undefined;
+      return;
+    }
+    this.watch.nextRunAt = Date.now() + min * 60 * 1000;
+    this.timer = window.setInterval(() => void this.tick(), min * 60 * 1000);
+  }
+
+  /** 定时器一轮：按当前开关决定「只盯」「只采」还是「先盯后采」 */
+  private async tick() {
+    const min = Math.max(MIN_INTERVAL, Math.round(this.settings.intervalMin || 30));
+    this.watch.nextRunAt = Date.now() + min * 60 * 1000;
+    await this.runOnce(false, { list: this.watch.running, collect: this.watch.collecting });
+  }
+
+  private stopAll(notify = false) {
     if (this.timer !== null) {
       window.clearInterval(this.timer);
       this.timer = null;
     }
     this.watch.running = false;
+    this.watch.collecting = false;
     this.watch.nextRunAt = undefined;
-    this.pushLog('自动更新已暂停', 'warn');
     this.emitWatch();
     this.renderStatus();
-    if (notify) new Notice('自动盯采已停止');
+    if (notify) new Notice('盯、采都已停止');
   }
 
   private renderStatus() {
     if (!this.statusEl) return;
     const last = this.state.lastRun;
-    const watching = this.timer !== null;
-    const icon = watching ? '●' : '○';
+    const active = this.watch.running || this.watch.collecting;
+    const icon = active ? '●' : '○';
     const tail = last
       ? last.error
         ? `错误：${last.error.slice(0, 22)}`
         : `+${last.written}/${last.found}`
       : '未运行';
-    this.statusEl.setText(`微信读书 ${icon} ${tail}`);
+    const modes = `${this.watch.running ? '盯' : ''}${this.watch.collecting ? '采' : ''}`;
+    this.statusEl.setText(`微信读书 ${icon}${modes ? ` ${modes}` : ''} ${tail}`);
   }
 
   /* --------------------------------- fetch --------------------------------- */
 
-  async runOnce(manual: boolean) {
+  async runOnce(manual: boolean, opts: { list?: boolean; collect?: boolean } = {}) {
+    /** 盯：拉列表、更新发现清单；采：把已发现的未归档文章落盘 */
+    const doList = opts.list !== false;
+    const doCollect = opts.collect !== false;
+    if (!doList && !doCollect) return;
     if (this.running) {
       if (manual) new Notice('上一轮还在跑');
       return;
@@ -1678,38 +1728,47 @@ export default class WereadMpCatcher extends Plugin {
       if (manual) new Notice(`Cookie 不完整，缺：${chk.missing.join(', ')}（缺 wr_gid 会报 -2012）`, 8000);
     }
     const accounts = this.settings.accounts.filter((a) => String(a.bookId || '').toUpperCase().startsWith('MP_WXS_'));
-    if (!accounts.length) {
+    if (doList && !accounts.length) {
       if (manual) new Notice('还没有公众号：设置里添加 bookid（MP_WXS_ 开头）');
       return;
     }
 
-    // 限频冷却期：一律不发列表请求，避免越试越锁
-    const coolLeft = (this.state.listCooldownUntil ?? 0) - Date.now();
-    if (coolLeft > 0) {
-      const mins = Math.ceil(coolLeft / 60000);
-      const msg = `列表接口还在限频冷却中，约 ${mins} 分钟后可再试（-2014）`;
-      this.pushLog(msg, 'err');
-      if (manual) new Notice(msg, 9000);
-      return;
+    // 限频冷却期：一律不发列表请求，避免越试越锁（只影响「盯」）
+    if (doList) {
+      const coolLeft = (this.state.listCooldownUntil ?? 0) - Date.now();
+      if (coolLeft > 0) {
+        const mins = Math.ceil(coolLeft / 60000);
+        const msg = `列表接口还在限频冷却中，约 ${mins} 分钟后可再试（-2014）`;
+        this.pushLog(msg, 'err');
+        if (manual) new Notice(msg, 9000);
+        return;
+      }
     }
 
     // 本轮只检查一部分公众号（游标轮转），总量 27 个号也不会一次全拉
-    const perRun = Math.max(1, Math.min(accounts.length, this.settings.maxAccountsPerRun ?? 5));
-    const cursor = this.state.accountCursor ?? 0;
     const batch: AccountRef[] = [];
-    for (let i = 0; i < perRun; i++) batch.push(accounts[(cursor + i) % accounts.length]);
-    this.state.accountCursor = (cursor + batch.length) % accounts.length;
+    if (doList) {
+      const perRun = Math.max(1, Math.min(accounts.length, this.settings.maxAccountsPerRun ?? 5));
+      const cursor = this.state.accountCursor ?? 0;
+      for (let i = 0; i < perRun; i++) batch.push(accounts[(cursor + i) % accounts.length]);
+      this.state.accountCursor = (cursor + batch.length) % accounts.length;
+    }
 
     this.running = true;
     this.watch.busy = true;
-    this.watch.phase = 'list';
+    this.watch.phase = doList ? 'list' : 'fetch';
     this.watch.accountIndex = 0;
     this.watch.accountTotal = batch.length;
+    this.watch.queueTotal = 0;
     this.watch.found = 0;
     this.watch.written = 0;
     this.watch.skipped = 0;
     this.watch.lastError = undefined;
-    this.pushLog(`开始更新 · 本轮检查 ${batch.length}/${accounts.length} 个公众号`);
+    this.pushLog(
+      doList
+        ? `开始盯 · 本轮检查 ${batch.length}/${accounts.length} 个公众号${doCollect ? '，随后归档' : '（只更新列表）'}`
+        : '开始采 · 取已发现的未归档文章',
+    );
     this.emitWatch();
     const client = new WereadClient(this.http, cookie);
     let found = 0;
@@ -1767,17 +1826,19 @@ export default class WereadMpCatcher extends Plugin {
         await sleep(this.settings.delayListMs);
       }
 
-      // ② 轮转落盘
-      const queue: Array<{ acc: AccountRef; item: ArticleItem }> = [];
+      // ② 生成落盘队列：盯+采时用刚拉的列表；只采时直接用发现清单
+      const maxRun = Math.max(1, this.settings.maxPerRun || 30);
+      let queue: Array<{ acc: AccountRef; item: ArticleItem }> = [];
+      if (doCollect && !doList) queue = this.buildCollectQueue(maxRun);
       let round = 0;
-      while (queue.length < this.settings.maxPerRun) {
+      while (doList && doCollect && queue.length < maxRun) {
         let added = 0;
         for (const g of queueByAccount) {
           const it = g.items[round];
           if (it) {
             queue.push({ acc: g.acc, item: it });
             added++;
-            if (queue.length >= this.settings.maxPerRun) break;
+            if (queue.length >= maxRun) break;
           }
         }
         if (!added) break;
@@ -1817,24 +1878,30 @@ export default class WereadMpCatcher extends Plugin {
       }
 
       this.state.lastRun = { at: Date.now(), found, written, skipped, error: riskHit ? '风控熔断' : undefined };
-      // 这一轮跑通了说明限频已解除，清掉冷却与退避计数
-      if (!riskHit) {
+      // 这一轮列表跑通了说明限频已解除，清掉冷却与退避计数（只采不碰列表，别误清）
+      if (doList && !riskHit) {
         this.state.listCooldownHits = 0;
         this.state.listCooldownUntil = 0;
       }
       await this.saveAll();
       if (manual) {
-        new Notice(`抓取完成：发现 ${found} 篇新文，落盘 ${written} 篇${skipped ? `，跳过 ${skipped}` : ''}`);
+        if (doList && doCollect) {
+          new Notice(`抓取完成：发现 ${found} 篇新文，落盘 ${written} 篇${skipped ? `，跳过 ${skipped}` : ''}`);
+        } else if (doList) {
+          new Notice(`列表已更新：发现 ${found} 篇新文（尚未落盘，开「采」或点单篇归档才会写文件）`, 7000);
+        } else {
+          new Notice(`归档完成：落盘 ${written} 篇${skipped ? `，跳过 ${skipped}` : ''}`);
+        }
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.state.lastRun = { at: Date.now(), found, written, skipped, error: msg };
       this.watch.lastError = msg.slice(0, 60);
       this.watch.phase = 'cooldown';
-      this.pushLog(`抓取中断：${msg}`, 'err');
+      this.pushLog(`${doList ? '盯' : '采'}中断：${msg}`, 'err');
       // -2014 是接口级限频：记冷却时间 + 指数退避（2h → 4h → 8h → 16h → 24h 封顶）。
       // 实测 30 分钟不够用，所以起点定在 2 小时，避免用户反复重试把窗口越推越长。
-      if (e instanceof RiskError && e.code === -2014) {
+      if (doList && e instanceof RiskError && e.code === -2014) {
         const hits = (this.state.listCooldownHits ?? 0) + 1;
         const hours = Math.min(24, 2 ** hits);
         this.state.listCooldownHits = hits;
@@ -1844,7 +1911,7 @@ export default class WereadMpCatcher extends Plugin {
         new Notice(`列表接口限频（-2014）\n已暂停到 ${until}\n期间不会发任何列表请求`, 12000);
       }
       await this.saveAll();
-      if (!(e instanceof RiskError && e.code === -2014)) new Notice(`抓取中断：${msg}`);
+      if (!(doList && e instanceof RiskError && e.code === -2014)) new Notice(`抓取中断：${msg}`);
     } finally {
       this.running = false;
       this.watch.busy = false;
@@ -1852,11 +1919,53 @@ export default class WereadMpCatcher extends Plugin {
       this.watch.lastRunAt = Date.now();
       const min = Math.max(MIN_INTERVAL, Math.round(this.settings.intervalMin || 30));
       this.watch.nextRunAt = this.timer !== null ? Date.now() + min * 60 * 1000 : undefined;
-      this.pushLog(written > 0 ? `这一轮收了 ${written} 篇新文章` : '这一轮没有新文章', written > 0 ? 'ok' : 'info');
+      const label = doList && doCollect ? '这一轮' : doList ? '盯' : '采';
+      this.pushLog(
+        written > 0
+          ? `${label}：写入 ${written} 篇${found && doList ? `，发现 ${found} 篇` : ''}`
+          : doList
+            ? `${label}：没有新文章`
+            : `${label}：没有待归档的文章`,
+        written > 0 ? 'ok' : 'info',
+      );
       this.emitWatch();
       this.renderStatus();
       this.notifyViews();
     }
+  }
+
+  /**
+   * 「采」的待办队列：只从发现清单里挑**未归档**的文章，不拉列表。
+   * 按发布时间从新到旧，每个号最多 maxPerAccount 篇，避免一次被一个号占满。
+   */
+  private buildCollectQueue(max: number): Array<{ acc: AccountRef; item: ArticleItem }> {
+    const disc = this.state.discovered || {};
+    const rows = Object.entries(disc)
+      .filter(([rid]) => !this.state.processed[rid])
+      .sort((a, b) => (b[1].time || 0) - (a[1].time || 0));
+    const out: Array<{ acc: AccountRef; item: ArticleItem }> = [];
+    const perAcc = new Map<string, number>();
+    const cap = Math.max(1, this.settings.maxPerAccount || 10);
+    for (const [rid, d] of rows) {
+      if (out.length >= max) break;
+      const n = perAcc.get(d.account) || 0;
+      if (n >= cap) continue;
+      perAcc.set(d.account, n + 1);
+      out.push({
+        acc: this.settings.accounts.find((a) => a.name === d.account) || { name: d.account, bookId: '' },
+        item: {
+          reviewId: rid,
+          title: d.title,
+          time: d.time,
+          readNum: d.readNum,
+          likeNum: d.likeNum,
+          picUrl: d.picUrl,
+          digest: d.digest,
+          mpName: d.account,
+        },
+      });
+    }
+    return out;
   }
 
   private async fetchOne(client: WereadClient, acc: AccountRef, item: ArticleItem): Promise<'written' | 'exists' | 'empty'> {
@@ -2274,12 +2383,21 @@ export default class WereadMpCatcher extends Plugin {
   }
 
   isWatching(): boolean {
-    return this.timer !== null;
+    return this.watch.running;
   }
 
+  isCollecting(): boolean {
+    return this.watch.collecting;
+  }
+
+  /** 盯：只更新列表，不落盘 */
   toggleWatchFromView(): void {
-    if (this.timer) this.stopWatch(true);
-    else this.startWatch(true);
+    this.setWatching(!this.watch.running, true);
+  }
+
+  /** 采：只归档已发现的文章 */
+  toggleCollectFromView(): void {
+    this.setCollecting(!this.watch.collecting, true);
   }
 
   accountNames(): string[] {
@@ -3049,8 +3167,8 @@ class WMSettingTab extends PluginSettingTab {
 
     this.frToggle(
       containerEl,
-      '启动时自动盯采',
-      '默认关闭。关闭时插件不会有任何自动行为：不轮询、不抓取、不写笔记；只有你点「开始更新」/「立即抓取一轮」才会归档',
+      '启动时自动盯列表',
+      '默认关闭。开启后启动时只定时更新公众号列表（发现新文章），不写任何笔记、不下载正文；归档必须手动打开「采」或单篇点「归档到本地」',
       this.plugin.settings.autoStart,
       async (v) => {
         this.plugin.settings.autoStart = v;

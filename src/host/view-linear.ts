@@ -310,8 +310,14 @@ export class WmcView extends ItemView {
       this.mode = this.mode === 'stats' ? 'list' : 'stats';
       this.render();
     });
-    this.iconBtn(bar, this.plugin.isWatching() ? 'pause' : 'play', this.plugin.isWatching() ? '停止盯采' : '开始盯采', () => {
+    const watching = this.plugin.isWatching();
+    this.iconBtn(bar, watching ? 'eye-off' : 'eye', watching ? '暂停盯（只更新列表）' : '开始盯（只更新列表，不归档）', () => {
       this.plugin.toggleWatchFromView();
+      this.render();
+    });
+    const collecting = this.plugin.isCollecting();
+    this.iconBtn(bar, collecting ? 'pause' : 'download', collecting ? '暂停采（停止自动归档）' : '开始采（自动归档已发现的文章）', () => {
+      this.plugin.toggleCollectFromView();
       this.render();
     });
     this.iconBtn(bar, 'settings-2', '设置', () => {
@@ -412,24 +418,35 @@ export class WmcView extends ItemView {
 
   private watchbar(parent: HTMLElement): void {
     const s = this.plugin.getWatchStatus();
-    if (!s.running && !s.busy && !s.lastRunAt && !s.log.length) return; // 完全没用过就不显示
+    if (!s.running && !s.collecting && !s.busy && !s.lastRunAt && !s.log.length) return; // 完全没用过就不显示
     const bar = parent.createDiv('wmc-watchbar');
     bar.createDiv('wmc-watch-dot');
     const main = bar.createDiv('wmc-watch-main');
     main.createDiv('wmc-watch-text');
     main.createDiv('wmc-progress').createDiv('wmc-progress-fill');
     const actions = bar.createDiv('wmc-watch-actions');
-    this.iconBtn(actions, 'zap', '立即抓取一轮', () => void this.plugin.runOnce(true));
-    const stopBtn = this.iconBtn(
-      actions,
-      s.busy ? 'square' : s.running ? 'pause' : 'play',
-      s.busy ? '停止盯采' : s.running ? '暂停盯采' : '开始盯采',
-      () => {
-        this.plugin.toggleWatchFromView();
-        this.refreshWatchbar();
-      },
+    // 手动跑一轮：盯只更新列表，采只归档已发现的文章
+    this.iconBtn(actions, 'zap', '立即盯一轮（只更新列表，不写笔记）', () =>
+      void this.plugin.runOnce(true, { list: true, collect: false }),
     );
-    if (s.busy || s.running) stopBtn.addClass('is-live');
+    this.iconBtn(actions, 'download', '立即采一轮（归档已发现的文章）', () =>
+      void this.plugin.runOnce(true, { list: false, collect: true }),
+    );
+    const mkToggle = (label: string, on: boolean, title: string, onClick: () => void) => {
+      const b = actions.createEl('button', { cls: `wmc-watch-toggle${on ? ' is-on' : ''}`, text: label });
+      b.setAttr('aria-pressed', String(on));
+      b.setAttr('title', title);
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    mkToggle('盯', s.running, s.running ? '暂停盯（停止更新列表）' : '开启盯：每轮只更新列表，绝不写笔记', () => {
+      this.plugin.toggleWatchFromView();
+      this.render();
+    });
+    mkToggle('采', s.collecting, s.collecting ? '暂停采（停止自动归档）' : '开启采：每轮把已发现的未归档文章落盘', () => {
+      this.plugin.toggleCollectFromView();
+      this.render();
+    });
     this.iconBtn(actions, 'scroll-text', this.logOpen ? '收起日志' : '盯采日志', () => {
       this.logOpen = !this.logOpen;
       this.render();
@@ -469,41 +486,48 @@ export class WmcView extends ItemView {
     let mode: 'busy' | 'idle' | 'error' | 'off' = 'off';
     let t = '';
     let pct = 0;
+    const flags = `${s.running ? '盯开' : '盯关'} · ${s.collecting ? '采开' : '采关'}`;
 
     if (s.busy) {
       mode = 'busy';
       if (s.phase === 'list') {
         pct = s.accountTotal ? s.accountIndex / s.accountTotal : 0;
-        t = `正在看「${s.account || '…'}」（第 ${s.accountIndex}/${s.accountTotal} 个号）`;
+        t = `正在盯列表「${s.account || '…'}」（第 ${s.accountIndex}/${s.accountTotal} 个号）`;
       } else {
         pct = s.queueTotal ? (s.written + s.skipped) / s.queueTotal : 0;
-        t = `正在存「${s.account || '…'}」的文章（${s.written + s.skipped}/${s.queueTotal} 篇）`;
+        t = `正在采「${s.account || '…'}」（${s.written + s.skipped}/${s.queueTotal} 篇）`;
       }
     } else if (s.lastError) {
       mode = 'error';
       pct = 1;
-      t = /2012|风控|登录/.test(s.lastError) ? '登录过期了 — 去设置里重新扫码就能继续' : `出错了：${s.lastError}`;
-    } else if (s.running) {
+      t = /2010|2012|风控|登录/.test(s.lastError) ? '登录过期了 — 点正文区「重新扫码登录」' : `出错了：${s.lastError}`;
+    } else if (s.running || s.collecting) {
       mode = 'idle';
       const intervalMs = Math.max(15, this.plugin.settings.intervalMin || 30) * 60000;
       const remain = s.nextRunAt ? Math.max(0, s.nextRunAt - Date.now()) : 0;
       pct = intervalMs ? Math.min(1, Math.max(0, 1 - remain / intervalMs)) : 0;
       const m = Math.floor(remain / 60000);
       const sec = Math.floor((remain % 60000) / 1000);
-      t = `自动更新中 · ${m} 分 ${sec} 秒后看下一轮${s.lastRunAt ? ` · 上次收了 ${s.written} 篇` : ''}`;
+      const last = this.plugin.state.lastRun;
+      const tail = last ? ` · 上次落盘 ${last.written} 篇` : '';
+      t = `${flags} · ${m} 分 ${sec} 秒后下一轮${tail}`;
     } else if (s.lastRunAt) {
       const d = new Date(s.lastRunAt);
       const p = (n: number) => String(n).padStart(2, '0');
-      t = `自动更新已暂停 · 上次 ${p(d.getHours())}:${p(d.getMinutes())} 收了 ${s.written} 篇`;
+      const last = this.plugin.state.lastRun;
+      t = `${flags} · 上次 ${p(d.getHours())}:${p(d.getMinutes())} 落盘 ${last?.written ?? 0} 篇`;
       pct = 1;
     } else {
-      t = '自动更新还没开启 — 点右边 ▶ 开始';
+      t = '两个开关都关着 — 「盯」只更新列表，「采」才会归档';
     }
 
     dot.className = `wmc-watch-dot is-${mode === 'busy' ? 'busy' : mode === 'idle' ? 'idle' : mode === 'error' ? 'error' : 'off'}`;
     fill.className = `wmc-progress-fill is-${mode}`;
     fill.setCssStyles({ width: `${Math.round(pct * 100)}%` });
     text.setText(t);
+    const toggles = bar.querySelectorAll<HTMLElement>('.wmc-watch-toggle');
+    const want = [s.running, s.collecting];
+    toggles.forEach((b, i) => b.toggleClass('is-on', !!want[i]));
   }
 
   /* ------------------------- 盯采管理面板（抽屉） ------------------------- */
