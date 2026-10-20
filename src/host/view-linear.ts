@@ -277,20 +277,20 @@ export class WmcView extends ItemView {
       });
     }
 
-    this.iconBtn(bar, 'bot', '本地 Agent', () => {
+    this.iconBtn(bar, 'bot', '本地 Agent：用本机 CLI 处理当前文章', () => {
       this.mode = this.mode === 'agent' ? 'list' : 'agent';
       this.render();
     });
-    this.iconBtn(bar, 'radar', this.panelOpen ? '关闭盯采管理' : '盯采管理', () => {
+    this.iconBtn(bar, 'radar', this.panelOpen ? '关闭盯采管理' : '盯采管理：勾选要跟的公众号', () => {
       this.panelOpen = !this.panelOpen;
       this.render();
     });
     // 已登录才显示：一键清空登录态，方便干净重扫（切号救急入口）
     if (this.plugin.loginState() !== 'none') {
-      this.iconBtn(bar, 'log-out', '退出登录（清空后重新扫码）', () => void this.plugin.logoutAccount());
+      this.iconBtn(bar, 'log-out', '退出登录：清空登录态，方便重新扫码', () => void this.plugin.logoutAccount());
     }
 
-    const grabBtn = this.iconBtn(bar, 'refresh-cw', '抓取一轮', () => {
+    const grabBtn = this.iconBtn(bar, 'refresh-cw', '抓取一轮：先盯列表，再归档新文', () => {
       void (async () => {
         if (grabBtn.hasClass('is-syncing')) return;
         const orbCtl = this.mountOrb(grabBtn);
@@ -303,10 +303,10 @@ export class WmcView extends ItemView {
         }
       })();
     }, true);
-    this.iconBtn(bar, 'archive', '归档某个号的全部历史', () =>
+    this.iconBtn(bar, 'archive', '归档全部历史：按号批量补历史文章', () =>
       new BackfillModal(this.app, this.plugin, this.account || undefined).open(),
     );
-    this.iconBtn(bar, 'bar-chart-3', '盯采统计', () => {
+    this.iconBtn(bar, 'bar-chart-3', '统计：总篇数 / 已归档 / 覆盖公众号', () => {
       this.mode = this.mode === 'stats' ? 'list' : 'stats';
       this.render();
     });
@@ -320,7 +320,7 @@ export class WmcView extends ItemView {
       this.plugin.toggleCollectFromView();
       this.render();
     });
-    this.iconBtn(bar, 'settings-2', '设置', () => {
+    this.iconBtn(bar, 'settings-2', '设置：登录、笔记目录、盯采节奏、AI', () => {
       // app.setting 不在 Obsidian 公开类型里，这里局部收窄
       const st = this.app as unknown as {
         setting?: { open?: () => void; openTabById?: (id: string) => void };
@@ -350,7 +350,7 @@ export class WmcView extends ItemView {
         o.value = v;
       }
       sel.value = value;
-      sel.setAttr('title', label);
+      sel.setAttr('aria-label', label);
       sel.addEventListener('change', () => onChange(sel.value));
       return sel;
     };
@@ -379,7 +379,7 @@ export class WmcView extends ItemView {
     for (const l of layouts) {
       const b = bar.createEl('button', { cls: `wmc-seg${this.layout === l ? ' is-active' : ''}` });
       setIcon(b, LAYOUT_ICON[l]);
-      b.setAttr('title', LAYOUT_LABEL[l]);
+      b.setAttr('aria-label', `${LAYOUT_LABEL[l]}视图`);
       b.addEventListener('click', () => {
         this.plugin.settings.layout = l;
         void this.plugin.saveAll();
@@ -435,7 +435,7 @@ export class WmcView extends ItemView {
     const mkToggle = (label: string, on: boolean, title: string, onClick: () => void) => {
       const b = actions.createEl('button', { cls: `wmc-watch-toggle${on ? ' is-on' : ''}`, text: label });
       b.setAttr('aria-pressed', String(on));
-      b.setAttr('title', title);
+      b.setAttr('aria-label', title);
       b.addEventListener('click', onClick);
       return b;
     };
@@ -540,7 +540,7 @@ export class WmcView extends ItemView {
     head.createSpan({ cls: 'wmc-panel-count', text: `${watchedCount} 个号` });
     const close = head.createEl('button', { cls: 'wmc-icon-btn' });
     setIcon(close, 'x');
-    close.setAttr('title', '关闭');
+    close.setAttr('aria-label', '关闭盯采管理');
     close.addEventListener('click', () => {
       this.panelOpen = false;
       this.render();
@@ -662,8 +662,8 @@ export class WmcView extends ItemView {
   private iconBtn(parent: HTMLElement, icon: string, label: string, onClick: () => void, cta = false): HTMLElement {
     const b = parent.createEl('button', { cls: `wmc-icon-btn${cta ? ' is-cta' : ''}` });
     setIcon(b, icon);
-    // 可读名用 visually-hidden 文本，不用 aria-label / title —— Obsidian 会把它们映射成 hover 气泡
-    b.createSpan({ cls: 'wmc-sr', text: label });
+    // aria-label：Obsidian 用它渲染中文 hover 气泡（title 会再叠一层浏览器原生提示，所以不用）
+    b.setAttr('aria-label', label);
     b.addEventListener('click', onClick);
     return b;
   }
@@ -909,7 +909,7 @@ export class WmcView extends ItemView {
     top.createSpan({ cls: 'wmc-side-title', text: '公众号' });
     const syncBtn = top.createEl('button', { cls: 'wmc-icon-btn' });
     setIcon(syncBtn, 'refresh-cw');
-    syncBtn.setAttr('title', '同步最新（只拉新文章，不动已存历史）');
+    syncBtn.setAttr('aria-label', '同步最新：只拉新文章，不动已存历史');
     // LoadingOrb：Claude Code 用的字符轮转，5 帧叠在同一位置只切透明度，字符不抖动
     syncBtn.addEventListener('click', () => {
       void (async () => {
@@ -920,10 +920,10 @@ export class WmcView extends ItemView {
       if (syncBtn.hasClass('is-syncing')) return;
       const orbCtl = this.mountOrb(syncBtn);
       orbCtl.start();
-      syncBtn.setAttr('title', '同步中…');
+      syncBtn.setAttr('aria-label', '同步中…');
       const n = await this.plugin.syncNewArticles(this.account, 20).catch(() => 0);
       orbCtl.stop();
-      syncBtn.setAttr('title', '同步最新（只拉新文章，不动已存历史）');
+      syncBtn.setAttr('aria-label', '同步最新：只拉新文章，不动已存历史');
       new Notice(n > 0 ? `「${this.account}」新增 ${n} 篇` : '没有新文章');
       if (n > 0) this.renderList();
         })();
@@ -931,7 +931,7 @@ export class WmcView extends ItemView {
 
     const add = top.createEl('button', { cls: 'wmc-icon-btn' });
     setIcon(add, 'settings-2');
-    add.setAttr('title', '管理要盯的公众号');
+    add.setAttr('aria-label', '管理要盯的公众号');
     add.addEventListener('click', () => {
       this.panelOpen = !this.panelOpen;
       this.render();
@@ -964,7 +964,7 @@ export class WmcView extends ItemView {
       const row = el.createDiv(`wmc-side-row${active ? ' is-active' : ''}`);
       row.createSpan({ cls: 'wmc-side-name', text: label });
       row.createSpan({ cls: 'wmc-side-count', text: String(count) });
-      row.setAttr('title', label);
+      row.setAttr('aria-label', label);
       row.addEventListener('click', () => {
         this.account = name;
         this.scrollMemory = 0;
@@ -1021,7 +1021,7 @@ export class WmcView extends ItemView {
     // 勾选框：只下载你勾的这几篇
     const cb = el.createEl('input', { type: 'checkbox', cls: 'wmc-pick' });
     cb.checked = this.selectedIds.has(r.reviewId);
-    cb.setAttr('title', '勾选后可点「下载所选」只下载这几篇');
+    cb.setAttr('aria-label', '勾选后可点「下载所选」只下载这几篇');
     cb.addEventListener('click', (ev) => ev.stopPropagation());
     cb.addEventListener('change', () => {
       if (cb.checked) this.selectedIds.add(r.reviewId);
