@@ -1149,7 +1149,7 @@ export default class WereadMpCatcher extends Plugin {
       }
     }
 
-    if (this.settings.autoStart) this.setWatching(true);
+    // 「启动时自动盯列表」入口已从设置页移除：启动后不自动跑，全部由主界面图标开关控制
   }
 
   onunload() {
@@ -3121,6 +3121,23 @@ class WMSettingTab extends PluginSettingTab {
     this.update();
   }
 
+  /**
+   * 重绘设置页但保留滚动位置。
+   * Obsidian 的 display() 会把内容清空重建，直接调用会让页面跳回顶部，
+   * 看起来就像"点个开关就乱跳到别处"。
+   */
+  private redrawKeepScroll(): void {
+    const scroller =
+      (this.containerEl.closest('.vertical-tab-content') as HTMLElement | null) ?? this.containerEl;
+    const top = scroller.scrollTop;
+    this.display();
+    const restore = () => {
+      scroller.scrollTop = top;
+    };
+    window.requestAnimationFrame(restore);
+    window.setTimeout(restore, 60);
+  }
+
   private renderBody(containerEl: HTMLElement): void {
 
     /* 1. 登录 */
@@ -3428,7 +3445,7 @@ class WMSettingTab extends PluginSettingTab {
         if (Number.isFinite(n) && n > 0) {
           this.plugin.settings.intervalMin = Math.max(MIN_INTERVAL, Math.round(n));
           await this.plugin.saveAll();
-          this.display();
+          this.redrawKeepScroll();
         }
       },
       { numeric: true },
@@ -3444,7 +3461,7 @@ class WMSettingTab extends PluginSettingTab {
         if (Number.isFinite(n) && n >= 1) {
           this.plugin.settings.pages = Math.min(5, Math.round(n));
           await this.plugin.saveAll();
-          this.display();
+          this.redrawKeepScroll();
         }
       },
       { numeric: true },
@@ -3461,7 +3478,7 @@ class WMSettingTab extends PluginSettingTab {
           if (Number.isFinite(n) && n >= 1) {
             this.plugin.settings.maxPerRun = Math.min(30, Math.round(n));
             await this.plugin.saveAll();
-            this.display();
+            this.redrawKeepScroll();
           }
         },
       },
@@ -3472,7 +3489,7 @@ class WMSettingTab extends PluginSettingTab {
           if (Number.isFinite(n) && n >= 1) {
             this.plugin.settings.maxPerAccount = Math.min(10, Math.round(n));
             await this.plugin.saveAll();
-            this.display();
+            this.redrawKeepScroll();
           }
         },
       },
@@ -3486,7 +3503,7 @@ class WMSettingTab extends PluginSettingTab {
       async (v) => {
         this.plugin.settings.rateSafeMode = v;
         await this.plugin.saveAll();
-        this.display();
+        this.redrawKeepScroll();
       },
     );
 
@@ -3501,7 +3518,7 @@ class WMSettingTab extends PluginSettingTab {
           if (Number.isFinite(n) && n >= 1) {
             this.plugin.settings.maxAccountsPerRun = Math.min(50, Math.round(n));
             await this.plugin.saveAll();
-            this.display();
+            this.redrawKeepScroll();
           }
         },
       },
@@ -3512,7 +3529,7 @@ class WMSettingTab extends PluginSettingTab {
           if (Number.isFinite(n) && n >= 500) {
             this.plugin.settings.delayListMs = Math.min(30000, Math.round(n));
             await this.plugin.saveAll();
-            this.display();
+            this.redrawKeepScroll();
           }
         },
       },
@@ -3528,7 +3545,7 @@ class WMSettingTab extends PluginSettingTab {
         if (Number.isFinite(n) && n >= 300) {
           this.plugin.settings.delayContentMs = Math.min(60000, Math.round(n));
           await this.plugin.saveAll();
-          this.display();
+          this.redrawKeepScroll();
         }
       },
       { numeric: true },
@@ -3566,7 +3583,7 @@ class WMSettingTab extends PluginSettingTab {
             this.plugin.state.listCooldownUntil = 0;
             this.plugin.state.listCooldownHits = 0;
             await this.plugin.saveAll();
-            this.display();
+            this.redrawKeepScroll();
           }),
       );
     }
@@ -3578,17 +3595,6 @@ class WMSettingTab extends PluginSettingTab {
       this.plugin.settings.downloadImages,
       async (v) => {
         this.plugin.settings.downloadImages = v;
-        await this.plugin.saveAll();
-      },
-    );
-
-    this.frToggle(
-      containerEl,
-      '启动时自动盯列表',
-      '默认关闭。开启后启动时只定时更新公众号列表（发现新文章），不写任何笔记、不下载正文；归档必须手动打开「采」或单篇点「归档到本地」',
-      this.plugin.settings.autoStart,
-      async (v) => {
-        this.plugin.settings.autoStart = v;
         await this.plugin.saveAll();
       },
     );
