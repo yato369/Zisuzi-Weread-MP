@@ -601,7 +601,12 @@ export default class WereadMpCatcher extends Plugin {
       this.renewFails = 0;
       if (!this.renewNoCookieWarned) {
         this.renewNoCookieWarned = true;
-        this.pushLog('续期请求已发送；本次服务端未换发新凭据（未临近过期时正常）', 'info');
+        const keys = Object.keys(r.headers || {});
+        const hasSetCookie = keys.some((k) => k.toLowerCase() === 'set-cookie');
+        this.pushLog(
+          `续期返回 200：${hasSetCookie ? '有 Set-Cookie 但凭据未变化' : '响应头里没有 Set-Cookie（可能未临近过期，或 Obsidian 未透出响应头）'}`,
+          'info',
+        );
       }
       if (!silent) new Notice('续期请求已发送：服务端本次没有换发新凭据（未临近过期时属正常）', 7000);
       return true;
