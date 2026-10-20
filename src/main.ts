@@ -988,6 +988,47 @@ export default class WereadMpCatcher extends Plugin {
       // 笔记可能被用户在文件管理器里删掉：启动时对一次账，别让统计留着幽灵记录
       void this.pruneProcessed(true);
     });
+
+    // 手动删除 / 移动笔记时，即时同步「已归档」索引，统计不再虚高
+    this.registerEvent(
+      this.app.vault.on('delete', (f) => {
+        const isFile = f instanceof TFile;
+        const prefix = isFile ? '' : f.path + '/';
+        let changed = false;
+        for (const rid of Object.keys(this.state.processed)) {
+          const p = this.state.processed[rid].path || '';
+          const hit = isFile ? p === f.path : p === f.path || p.startsWith(prefix);
+          if (hit) {
+            delete this.state.processed[rid];
+            changed = true;
+          }
+        }
+        if (!changed) return;
+        void this.saveAll();
+        this.notifyViews();
+        new Notice('已同步：被删除的笔记不再计入「已归档」', 4000);
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on('rename', (f, oldPath) => {
+        const isFile = f instanceof TFile;
+        let changed = false;
+        for (const rid of Object.keys(this.state.processed)) {
+          const entry = this.state.processed[rid];
+          const p = entry.path || '';
+          if (p === oldPath) {
+            entry.path = f.path;
+            changed = true;
+          } else if (!isFile && p.startsWith(oldPath + '/')) {
+            entry.path = f.path + p.slice(oldPath.length);
+            changed = true;
+          }
+        }
+        if (!changed) return;
+        void this.saveAll();
+        this.notifyViews();
+      }),
+    );
     this.addRibbonIcon('rss', '微信读书公众号：打开列表', () => void this.activateView());
     this.addCommand({
       id: 'open-list',
