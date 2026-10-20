@@ -1268,6 +1268,19 @@ export class WmcView extends ItemView {
     bar.createSpan({ cls: 'wmc-preview-tag', text: '预览' });
     bar.createSpan({ cls: 'wmc-preview-note', text: '未归档 · 只读内存，关掉 Obsidian 就没了' });
     const act = bar.createDiv('wmc-preview-act');
+    let holder: HTMLElement;
+    const copyBtn = act.createEl('button', { cls: 'wmc-text-btn', text: '复制全文' });
+    copyBtn.addEventListener('click', () => {
+      const text = holder?.innerText.trim();
+      if (!text) {
+        new Notice('正文还没加载好');
+        return;
+      }
+      void navigator.clipboard.writeText(text).then(() => {
+        copyBtn.setText('已复制');
+        window.setTimeout(() => copyBtn.setText('复制全文'), 1500);
+      });
+    });
     const btn = act.createEl('button', { cls: 'wmc-text-btn is-primary', text: '归档到本地' });
     btn.addEventListener('click', () => {
       void (async () => {
@@ -1286,7 +1299,7 @@ export class WmcView extends ItemView {
       })();
     });
 
-    const holder = box.createDiv('wmc-preview-body');
+    holder = box.createDiv('wmc-preview-body');
     const paint = async (job: Promise<PreviewResult>): Promise<void> => {
       holder.empty();
       holder.removeClass('markdown-rendered');
@@ -1296,8 +1309,18 @@ export class WmcView extends ItemView {
       holder.empty();
       if (!res.ok) {
         holder.createDiv({ cls: 'wmc-hint', text: res.reason || '预览失败' });
+        // 登录态过期（-2010/-2012）是最常见的失败：直接给一个重新扫码的入口，
+        // 不用让用户自己去设置页翻
+        const needLogin = /登录|2010|2012/.test(res.reason || '');
+        if (needLogin) {
+          const login = holder.createEl('button', { cls: 'wmc-text-btn is-primary', text: '重新扫码登录' });
+          login.addEventListener('click', () => this.plugin.startQrLogin());
+        }
         if (!res.fatal) {
           const retry = holder.createEl('button', { cls: 'wmc-text-btn', text: '重试' });
+          retry.addEventListener('click', () => void paint(this.plugin.previewArticle(r.reviewId)));
+        } else if (needLogin) {
+          const retry = holder.createEl('button', { cls: 'wmc-text-btn', text: '已登录，重试' });
           retry.addEventListener('click', () => void paint(this.plugin.previewArticle(r.reviewId)));
         }
         return;

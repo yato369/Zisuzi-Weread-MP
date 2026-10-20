@@ -3471,3 +3471,12 @@
 .wmc-preview-body .wmc-hint {
   padding: 28px 8px;
 }
+
+/* 自定义视图不在 .markdown-preview-view 里：部分主题/插件会对 .view-content
+   设 user-select: none，导致详情正文选不中。这里显式恢复文本选择。 */
+.wmc-detail-body,
+.wmc-preview-body,
+.wmc-detail-body :is(p, span, div, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, code, pre, a, strong, em) {
+  -webkit-user-select: text;
+  user-select: text;
+}
