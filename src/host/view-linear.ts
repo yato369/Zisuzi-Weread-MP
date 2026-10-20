@@ -2,7 +2,7 @@ import { ItemView, MarkdownRenderer, Notice, WorkspaceLeaf, setIcon,
   TFile,
 } from 'obsidian';
 import type WereadMpCatcher from '../main';
-import type { WatchStatus } from '../main';
+import type { PreviewResult, WatchStatus } from '../main';
 import { AGENT_PRESETS } from '../main';
 import { BackfillModal } from './backfill-modal';
 
@@ -1187,7 +1187,20 @@ export class WmcView extends ItemView {
     mkTab('origin', '原文');
 
     const body = col.createDiv('wmc-detail-body');
-    if (aside) void this.renderArticleAgent(r, aside);
+
+    // 已归档且笔记文件真的在 → 直接读本地；否则走内存预览（不落盘）
+    const archivedFile =
+      r.archived && r.path ? this.app.vault.getAbstractFileByPath(r.path) : null;
+    const hasNote = archivedFile instanceof TFile;
+    // 进详情就先抓正文（只在内存里）：正文区和侧栏 Agent 共用同一个请求
+    const previewJob = !hasNote && this.tab === 'body' ? this.plugin.previewArticle(r.reviewId) : null;
+
+    if (aside) {
+      void (async () => {
+        const md = previewJob ? (await previewJob).md || '' : '';
+        if (aside.isConnected) await this.renderArticleAgent(r, aside, md);
+      })();
+    }
 
     if (this.tab === 'agent') {
       await this.renderArticleAgent(r, body);
@@ -1242,38 +1255,61 @@ export class WmcView extends ItemView {
       return;
     }
 
-    if (r.archived && r.path) {
-      const f = this.app.vault.getAbstractFileByPath(r.path);
-      if (f instanceof TFile) {
-        const md = await this.app.vault.cachedRead(f);
-        body.addClass('markdown-rendered');
-        await MarkdownRenderer.render(this.app, md, body, r.path, this);
-        return;
-      }
+    if (hasNote && archivedFile instanceof TFile) {
+      const md = await this.app.vault.cachedRead(archivedFile);
+      body.addClass('markdown-rendered');
+      await MarkdownRenderer.render(this.app, md, body, r.path || '', this);
+      return;
     }
-    body.createDiv('wmc-hint').setText('这篇还没归档。');
-    const btn = body.createEl('button', { cls: 'wmc-text-btn is-primary', text: '抓取并归档' });
+
+    // 未归档：正文照常显示（纯内存预览），只有点「归档到本地」才写文件
+    const box = body.createDiv('wmc-preview');
+    const bar = box.createDiv('wmc-preview-bar');
+    bar.createSpan({ cls: 'wmc-preview-tag', text: '预览' });
+    bar.createSpan({ cls: 'wmc-preview-note', text: '未归档 · 只读内存，关掉 Obsidian 就没了' });
+    const act = bar.createDiv('wmc-preview-act');
+    const btn = act.createEl('button', { cls: 'wmc-text-btn is-primary', text: '归档到本地' });
     btn.addEventListener('click', () => {
       void (async () => {
-      btn.disabled = true;
-      btn.setText('抓取中…');
-      const ok = await this.plugin.archiveSingle(r.reviewId, r.account);
-      btn.disabled = false;
-      if (ok) {
-        const fresh = this.rows().find((x) => x.reviewId === r.reviewId);
-        if (fresh) {
-          this.selected = fresh;
-          this.render();
+        btn.disabled = true;
+        btn.setText('归档中…');
+        const ok = await this.plugin.archiveSingle(r.reviewId, r.account);
+        btn.disabled = false;
+        btn.setText(ok ? '已归档' : '失败，重试');
+        if (ok) {
+          const fresh = this.rows().find((x) => x.reviewId === r.reviewId);
+          if (fresh) {
+            this.selected = fresh;
+            this.render();
+          }
         }
-      } else {
-        btn.setText('失败，重试');
-      }
-        })();
+      })();
     });
+
+    const holder = box.createDiv('wmc-preview-body');
+    const paint = async (job: Promise<PreviewResult>): Promise<void> => {
+      holder.empty();
+      holder.removeClass('markdown-rendered');
+      holder.createDiv({ cls: 'wmc-hint', text: '正在读取正文…（只在内存里，不落盘）' });
+      const res = await job;
+      if (!holder.isConnected) return;
+      holder.empty();
+      if (!res.ok) {
+        holder.createDiv({ cls: 'wmc-hint', text: res.reason || '预览失败' });
+        if (!res.fatal) {
+          const retry = holder.createEl('button', { cls: 'wmc-text-btn', text: '重试' });
+          retry.addEventListener('click', () => void paint(this.plugin.previewArticle(r.reviewId)));
+        }
+        return;
+      }
+      holder.addClass('markdown-rendered');
+      await MarkdownRenderer.render(this.app, res.md || '', holder, '', this);
+    };
+    if (previewJob) void paint(previewJob);
   }
 
   /** 就地处理当前文章：把正文喂给本地 Agent，结果可写回笔记 */
-  private async renderArticleAgent(r: RowItem, body: HTMLElement): Promise<void> {
+  private async renderArticleAgent(r: RowItem, body: HTMLElement, previewBody = ''): Promise<void> {
     let md = '';
     if (r.path) {
       try {
@@ -1282,6 +1318,8 @@ export class WmcView extends ItemView {
         /* 未归档也能处理，只是没有正文 */
       }
     }
+    // 未归档：用详情页刚抓到的内存预览正文（不额外发请求、不落盘）
+    if (!md && previewBody) md = previewBody;
     const plain = md
       .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
       .replace(/<[^>]+>/g, '')
@@ -1360,6 +1398,8 @@ export class WmcView extends ItemView {
           write.disabled = true;
             })();
         });
+      } else if (acc.trim()) {
+        body.createDiv({ cls: 'wmc-hint', text: '这篇还没归档，结果不会写回笔记；点上方「归档到本地」后可保存。' });
       }
     };
 

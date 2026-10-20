@@ -168,6 +168,21 @@ interface WMState {
   mpUrls?: Record<string, string>;
 }
 
+/**
+ * 内存预览的结果。
+ * 预览只把正文转成 Markdown 放在内存里，不写笔记、不下载图片，
+ * 关掉 Obsidian 或缓存被挤出就没了 —— 用户点「归档」才真正落盘。
+ */
+export interface PreviewResult {
+  ok: boolean;
+  /** 转好的 Markdown（失败时为空） */
+  md?: string;
+  /** 失败原因（已经翻成人话，可直接显示） */
+  reason?: string;
+  /** 重试也没用（未登录 / 限频冷却 / 这类文章本身没有正文） */
+  fatal?: boolean;
+}
+
 const DEFAULTS: WMSettings = {
   cookie: '',
   wereadApiKey: '',
@@ -318,10 +333,19 @@ export default class WereadMpCatcher extends Plugin {
   /** 正在飞的取地址请求（同一个 reviewId 只发一次） */
   private mpUrlPending = new Map<string, Promise<string>>();
   /**
-   * 最近抓过的正文 HTML（只留 3 篇，约 10MB 内存）。
-   * 一篇 3.5MB，归档之后马上点「原文」不该再下一次。
+   * 最近抓过的正文 HTML（只留 5 篇，约 17MB 内存）。
+   * 一篇 3.5MB，归档之后马上点「原文」不该再下一次；
+   * 预览转成 Markdown 后，点「归档」也能直接复用这一份，不重复请求。
    */
   private contentCache = new Map<string, string>();
+  /**
+   * 预览缓存：reviewId → 已转好的 Markdown（几十 KB/篇，只留 5 篇）。
+   * 纯内存，不落盘；挤出即丢，重新点开时会再抓一次正文。
+   */
+  private previewCache = new Map<string, { md: string; at: number }>();
+  private previewPending = new Map<string, Promise<PreviewResult>>();
+  /** 上一次正文请求的时间戳，用来给预览之间留安全间隔（防风控） */
+  private lastContentAt = 0;
   private statusEl: HTMLElement | null = null;
 
   private watch: WatchStatus = {
@@ -2321,7 +2345,7 @@ export default class WereadMpCatcher extends Plugin {
     if (hit) return hit;
     const html = await client.getContentHtml(reviewId);
     this.contentCache.set(reviewId, html);
-    while (this.contentCache.size > 3) {
+    while (this.contentCache.size > 5) {
       const oldest = this.contentCache.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       this.contentCache.delete(oldest);
@@ -2355,6 +2379,105 @@ export default class WereadMpCatcher extends Plugin {
     }
   }
 
+  /**
+   * 详情页「正文」预览：抓正文并转 Markdown，**只在内存里**，不写笔记、不下载图片。
+   * 用户点「归档」时才走 archiveSingle 落盘；那时 fetchOne 会命中 contentCache，
+   * 不会为了同一篇再请求一次 3.5MB。
+   */
+  async previewArticle(reviewId: string): Promise<PreviewResult> {
+    const hit = this.previewCache.get(reviewId);
+    if (hit) {
+      // 命中就续命：LRU 里把它挪到队尾
+      this.previewCache.delete(reviewId);
+      this.previewCache.set(reviewId, hit);
+      return { ok: true, md: hit.md };
+    }
+    // 详情页可能在几毫秒内连渲两次，同一篇只允许一个请求在飞
+    const pending = this.previewPending.get(reviewId);
+    if (pending) return pending;
+    const job = this.doPreview(reviewId).finally(() => this.previewPending.delete(reviewId));
+    this.previewPending.set(reviewId, job);
+    return job;
+  }
+
+  /** 已缓存的预览正文（不触发网络请求），给 Agent 侧栏之类的地方用 */
+  getPreview(reviewId: string): string {
+    return this.previewCache.get(reviewId)?.md || '';
+  }
+
+  private async doPreview(reviewId: string): Promise<PreviewResult> {
+    const cookie = normalizeCookie(this.settings.cookie || '');
+    if (!cookie && !this.settings.useSession) {
+      return { ok: false, reason: '还没登录：先在设置里扫码或粘贴 Cookie', fatal: true };
+    }
+    // 列表刚被限频时，正文接口也别去撞
+    const coolLeft = (this.state.listCooldownUntil ?? 0) - Date.now();
+    if (coolLeft > 0) {
+      const until = new Date(this.state.listCooldownUntil!).toLocaleString();
+      return { ok: false, reason: `接口限频冷却中（-2014），${until} 后再试`, fatal: true };
+    }
+    // 节流：两次正文请求之间至少隔 delayContentMs（默认 4.5s，防风控安全档）。
+    // 正文 HTML 还在内存里时不会发请求，没必要空等。
+    const fromMemory = this.contentCache.has(reviewId);
+    const gap = Math.max(1500, this.settings.delayContentMs || 4500);
+    if (!fromMemory) {
+      const wait = this.lastContentAt + gap - Date.now();
+      if (wait > 0) await sleep(Math.min(wait, gap));
+      this.lastContentAt = Date.now();
+    }
+
+    const client = new WereadClient(this.http, cookie);
+    try {
+      const html = await this.loadContent(client, reviewId);
+      // 顺手记住原文地址，「原文」tab 之后就不用再抓一次
+      const mpUrl = extractMpOriginalUrl(html);
+      if (mpUrl) {
+        if (!this.state.mpUrls) this.state.mpUrls = {};
+        this.state.mpUrls[reviewId] = mpUrl;
+        const rec = this.state.discovered?.[reviewId];
+        if (rec) rec.mpUrl = mpUrl;
+      }
+
+      const parsed = htmlToMarkdown(html);
+      let md = parsed.markdown;
+      const empty = !md.trim() && !parsed.images.length && !parsed.media.length;
+
+      // 图片：预览不下载，直接把占位换成原站地址（可能被拦成裂图，但零落盘）
+      if (parsed.images.length) md = replaceImagePlaceholders(md, parsed.images.map((i) => i.src));
+      if (parsed.media.length) {
+        md = replaceMediaPlaceholders(
+          md,
+          parsed.media.map((m) => ({ type: m.type, url: m.direct || m.url, name: m.name })),
+        );
+      }
+
+      // 图片笔记（小绿书）/ 视频号：HTML 里没有 js_content，只能拿摘要兜底
+      if (empty) {
+        const d = this.state.discovered?.[reviewId];
+        const bits: string[] = [
+          '> 这篇没有可提取的正文（微信读书只存了封面/摘要），点「原文」可在微信里看全文。',
+        ];
+        if (d?.digest) bits.push('', d.digest);
+        if (mpUrl) bits.push('', `[在微信中打开公众号原文](${mpUrl})`);
+        if (!d?.digest && !mpUrl) {
+          return { ok: false, reason: '这篇没有正文也没有摘要（可能已删除，或只能在微信里打开）', fatal: true };
+        }
+        md = bits.join('\n');
+      }
+
+      this.previewCache.set(reviewId, { md, at: Date.now() });
+      while (this.previewCache.size > 5) {
+        const oldest = this.previewCache.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.previewCache.delete(oldest);
+      }
+      return { ok: true, md };
+    } catch (e) {
+      if (e instanceof RiskError) return { ok: false, reason: e.message, fatal: true };
+      return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
   /** 列表里点「抓取并归档」走这里 */
   async archiveSingle(reviewId: string, accountName: string): Promise<boolean> {
     const acc = this.settings.accounts.find((a) => (a.name || a.bookId) === accountName);
@@ -2383,7 +2506,11 @@ export default class WereadMpCatcher extends Plugin {
     const client = new WereadClient(this.http, cookie);
     try {
       const ok = await this.fetchOne(client, acc, item);
-      if (ok === 'written') await this.saveAll();
+      if (ok === 'written') {
+        await this.saveAll();
+        // 已落盘，内存预览那份没用了
+        this.previewCache.delete(reviewId);
+      }
       if (ok === 'empty') {
         new Notice('这篇没有正文也没有封面（可能是已删除，或只能在微信里打开），已跳过', 6000);
         return false;
