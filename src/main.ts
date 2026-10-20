@@ -566,8 +566,8 @@ export default class WereadMpCatcher extends Plugin {
   }
 
   /**
-   * 轻量续期：/api/user/info 是最便宜的登录态探测，
-   * 服务端会顺带下发新的 wr_skey（由 absorbSetCookie 写回）。
+   * 轻量续期：请求首页 HTML（浏览器刷新时正是这个响应下发新的 wr_skey），
+   * 新凭据由 absorbSetCookie 写回 settings.cookie。
    */
   async renewSession(silent = true): Promise<boolean> {
     if (!this.hasLogin()) return false;
@@ -3042,6 +3042,18 @@ class WMSettingTab extends PluginSettingTab {
       loginBtns,
     );
 
+    this.frToggle(
+      containerEl,
+      '登录态自动续期',
+      '默认开启。每 30 分钟请求一次微信读书首页，让服务端续发新的 wr_skey；抓取时收到的 Set-Cookie 也会自动保存。这样不用每隔一个多小时就重新扫码',
+      this.plugin.settings.keepAlive !== false,
+      (v) => this.plugin.setKeepAlive(v),
+    );
+
+    this.frButtons(containerEl, '续期登录态', '不确定登录态还在不在时点一下：成功会提示「登录态已续期」，上面状态卡的「网页登录态」也会同步更新', [
+      { text: '立即续期', onClick: () => this.plugin.renewSession(false) },
+    ]);
+
     // 高级：手动 Cookie（渐进展开，不占视觉）
     const adv = containerEl.createEl('details', { cls: 'wmc-adv' });
     adv.createEl('summary', { text: '高级：手动 cookie / 诊断' });
@@ -3409,20 +3421,6 @@ class WMSettingTab extends PluginSettingTab {
       },
     );
 
-    this.frToggle(
-      containerEl,
-      '登录态自动续期',
-      '默认开启。每 30 分钟发一次轻量请求（用户信息接口），让服务端续发 wr_skey，避免约 90 分钟就过期要重新扫码；抓取时收到的 Set-Cookie 也会自动保存',
-      this.plugin.settings.keepAlive !== false,
-      (v) => this.plugin.setKeepAlive(v),
-    );
-
-    this.frButtons(containerEl, '手动续期', '长时间没用、又不确定登录态还在不在时，点一下探测并续期', [
-      {
-        text: '立即续期',
-        onClick: () => this.plugin.renewSession(false),
-      },
-    ]);
 
     /* 4. AI 模型 */
     containerEl.createDiv({ cls: 'wmc-settings-h', text: 'AI 模型（可选）' });
