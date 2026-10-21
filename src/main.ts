@@ -2981,6 +2981,11 @@ export default class WereadMpCatcher extends Plugin {
 
       // 图片笔记（小绿书）/ 视频号：HTML 里没有 js_content，只能拿摘要兜底
       if (empty) {
+        // 诊断日志：万一又出现「有标题却没正文」，日志里能直接看出服务端到底返回了什么
+        const hasJsc = /<div[^>]*\bid=["']js_content["']/.test(html);
+        const hasNoenc = /content_noencode/.test(html);
+        const shape = hasJsc ? '有 js_content' : hasNoenc ? '只有 noencode' : `无正文标记，开头 ${html.slice(0, 80).replace(/\s+/g, ' ')}`;
+        this.pushLog(`预览解析为空：HTML ${html.length} 字符，${shape}`, 'info');
         const d = this.state.discovered?.[reviewId];
         const bits: string[] = [
           '> 这篇没有可提取的正文（微信读书只存了封面/摘要），点「原文」可在微信里看全文。',

@@ -387,6 +387,14 @@ export class WereadClient {
     const url = `https://weread.qq.com/web/mp/content?reviewId=${encodeURIComponent(reviewId)}`;
     const r = await this.http(url, this.headers());
     if (r.status !== 200) throw new Error(`正文 HTTP ${r.status}`);
+    // 登录态过期等情况，服务端会返回「状态 200 的 JSON」而不是 HTML：
+    // {"errCode":-2012,"errMsg":"登录超时"}。不识别的话这段 JSON 会被当 HTML
+    // 解析成空，界面误报「微信读书只存了封面/摘要」，让人白找原因。
+    const t = r.text.trimStart();
+    if (t.startsWith('{')) {
+      // -2012/-2014 等会作为 RiskError 向上抛，由调用方给出真实原因
+      assertNoRisk(parseJson(t), '正文');
+    }
     return r.text;
   }
 
